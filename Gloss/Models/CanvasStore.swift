@@ -209,13 +209,9 @@ public final class CanvasStore {
         let py = Int(point.y.rounded())
         guard px >= 0, px < width, py >= 0, py < height else { return nil }
         guard let data = context.data else { return nil }
-        // Our context has y-flipped CTM but the underlying buffer is bottom-up
-        // bitmap. Rows in memory: row 0 = bottom-most. We want top-left origin
-        // so flip the y when reading.
-        let flippedY = (height - 1) - py
         let bytesPerRow = context.bytesPerRow
         let ptr = data.assumingMemoryBound(to: UInt8.self)
-        let offset = flippedY * bytesPerRow + px * 4
+        let offset = py * bytesPerRow + px * 4
         let r = ptr[offset + 0]
         let g = ptr[offset + 1]
         let b = ptr[offset + 2]

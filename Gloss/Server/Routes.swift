@@ -164,8 +164,15 @@ enum GlossRoutes {
 
     private static func decodeCommand(body: Data, inferredType: String) throws -> DrawCommand {
         let source = body.isEmpty ? Data("{}".utf8) : body
-        guard var object = try JSONSerialization.jsonObject(with: source) as? [String: Any] else {
-            throw GlossError.bad("Expected a JSON object body.")
+        let jsonObject: Any
+        do {
+            jsonObject = try JSONSerialization.jsonObject(with: source)
+        } catch {
+            throw GlossError(code: "bad_json", message: "Invalid JSON body: \(error.localizedDescription)")
+        }
+
+        guard var object = jsonObject as? [String: Any] else {
+            throw GlossError(code: "bad_json", message: "Expected a JSON object body.")
         }
         object["type"] = object["type"] ?? inferredType
         let normalized = try JSONSerialization.data(withJSONObject: object)

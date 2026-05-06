@@ -13,17 +13,21 @@ Gloss/
     ├── Info.plist
     ├── Gloss.entitlements
     ├── Models/
-    │   ├── CanvasStore.swift     ← CGContext source of truth, MainActor command processor, revision counter
-    │   ├── DrawCommand.swift     ← Codable command types (stroke/shape/text/image/clear/undo/redo)
-    │   └── StrokeSmoother.swift  ← Catmull-Rom → cubic Bezier smoothing
+    │   ├── CanvasStore.swift     ← MainActor command processor, revision counter, undo/redo (full layer-stack snapshots)
+    │   ├── LayerStack.swift      ← Per-layer CGContext storage + composite + snapshot/restore (v1.2)
+    │   ├── BrushEngine.swift     ← 6 brushes (round/calligraphy/marker/pencil/airbrush/chalk), pressure (arclength), taper (v1.2)
+    │   ├── DrawCommand.swift     ← Codable command types + GlossLayer + LayerStackState + canvas presets
+    │   ├── StrokeSmoother.swift  ← Catmull-Rom → cubic Bezier smoothing
+    │   └── AsciiCanvasEncoder.swift ← Color / braille / brightness encoders for /canvas.ascii
     ├── Views/
     │   ├── ContentView.swift     ← Main window UI + chrome overlay (revision/last-author/cursors)
-    │   └── CanvasView.swift      ← NSViewRepresentable wrapping a layer-backed view that displays the CGImage snapshot
+    │   ├── CanvasView.swift      ← NSViewRepresentable wrapping a layer-backed view that displays the composite image
+    │   └── LayerPanel.swift      ← Right-side layer sidebar — visibility/opacity/blend/lock/active/reorder/delete (v1.2)
     ├── Services/
     │   └── PNGExporter.swift     ← CGImage → PNG bytes, max_dim downscale, region crop
     └── Server/                   ← Codex territory
         ├── GlossServer.swift     ← Network.framework HTTP on :7778
-        └── Routes.swift          ← Route handlers: /state, /canvas.png, /region.png, /sample, /stroke, /shape, /text, /image, /clear, /undo, /redo, /resize
+        └── Routes.swift          ← Route handlers: /state, /canvas.png, /region.png, /sample, /stroke, /shape, /text, /image, /path, /pixel, /pixels, /clear, /undo, /redo, /resize, /export, /canvas.ascii, /sample/grid, /sample/path, /layer/* (v1.2), /canvas/new (v1.2), /canvas/presets (v1.2)
 ```
 
 ## Source of truth
@@ -71,7 +75,36 @@ All mutation commands accept optional `idempotencyKey: String`. The server keeps
 
 ## Multi-LLM coordination
 
-ONE shared canvas, attribution per command. Each command carries `author: String` (convention: "claude" / "codex" / "brenden"). Commands stomp each other freely — collaboration emerges from us watching the canvas and reacting. Per-LLM layers is a v2 feature; the data model already carries an optional `layerID` so layers are additive.
+Each command carries `author: String` (convention: "claude" / "codex" / "brenden") and an optional `layerID`. Without `layerID` a command paints on the active layer. With an explicit `layerID` it paints on that layer (auto-created if the ID matches the known author pattern `{claude,codex,brenden}-layer`, rejected otherwise). Three authors painting on three named layers stay visually separable; turn off another author's layer to hide their work without losing it.
+
+## Layers (v1.2)
+
+`LayerStack` owns one CGContext per layer (sRGB premultiplied RGBA, top-left origin). The composite image is what reads/saves/samples — `/sample`, `/canvas.png`, `/canvas.ascii`, `/region.png` all flatten through visible layers.
+
+- `layers[]` are stored bottom → top (`activeLayerID` defaults to "base").
+- Per-layer state: `visible`, `opacity` (0..1), `blend` (subset of CGBlendMode), `locked`.
+- Locked layer + draw → `GlossError(code: "layer_locked")` → HTTP 400.
+- Cap = 16 layers (`LayerStack.defaultMaxLayers`). Hitting it returns `layer_cap` → HTTP 400.
+- Undo/redo snapshots **the entire stack** — pixels per layer + ordering + active + visibility/opacity/blend/lock. Restoring only the composite would silently break layers.
+- `/state` exposes `layerState` with `{ layers[], activeLayerID, memoryUsageBytes, memoryCapBytes, maxLayers }`.
+
+## Brushes (v1.2)
+
+CanvasStore.drawStroke and drawPath dispatch to `BrushEngine` whenever `brush != .round`, or when `pressures` is set, or when `taper != .none`. Pure round + uniform pressure stays on the fast CGContext.strokePath() path so v1.0/v1.1 behavior is unchanged.
+
+| brush       | shape                                                                |
+|-------------|----------------------------------------------------------------------|
+| round       | filled antialiased circle stamps (or CGContext.strokePath fast path) |
+| calligraphy | rotated ellipse, width = base * (1 - \|cos(strokeDir - nibAngle)\|·0.7) |
+| marker      | core circle + soft outer ring (35% alpha)                             |
+| pencil      | many tiny low-alpha dots scattered within stroke radius (graphite)    |
+| airbrush    | Gaussian-distributed pixel scatter, deterministic seed                |
+| chalk       | grainy rectangles in circular footprint, ~45% randomly skipped       |
+
+- **Pressure** (`pressures: [Double]?`): linear interpolation **by arclength**, not point index. Strict count match for `/stroke` (must equal `points.count`). For `/path` it's resampled across flattened anchors.
+- **Taper** (`taper: "in"|"out"|"both"|"none"`): multiplier applied after pressure. Taper length = `min(totalLen * 0.5, max(baseWidth * 2, totalLen * 0.15))`.
+- **Determinism for airbrush/chalk**: seed = `djb2(idempotencyKey)` if present, else `djb2("@author#layerID|stroke|brush|color|width")`. Never wall-clock, never revision.
+- **Calligraphy nib**: runtime angle (no precomputed stamp). `brushAngle` is in radians.
 
 ## Build workflow
 

@@ -81,7 +81,30 @@ download() {
 }
 
 log "checking server at $BASE_URL"
-request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["width"] > 0 and j["height"] > 0'
+request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["width"] > 0 and j["height"] > 0 and j["layerState"]["activeLayerID"]'
+
+log "canvas presets and new canvas reset"
+request GET "$BASE_URL/canvas/presets" | assert_json 'j["ok"] is True and j["presets"][0]["name"] == "1024_square"'
+request POST "$BASE_URL/canvas/new" "{\"author\":\"codex\",\"idempotencyKey\":\"smoke-$RUN_ID-new\",\"width\":1024,\"height\":1024,\"background\":\"#FFFFFF\",\"preserveLayers\":false}" | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/layers" | assert_json 'j["ok"] is True and j["layerState"]["activeLayerID"] == "base" and j["layerState"]["layers"][0]["id"] == "base"'
+
+log "layers"
+LAYER_ID="smoke-$RUN_ID-layer"
+request POST "$BASE_URL/layer/create" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-create","id":"'"$LAYER_ID"'","name":"Smoke Layer","setActive":true}' | assert_json 'j["ok"] is True and j["layer"]["id"] and j["layerState"]["activeLayerID"] == j["layer"]["id"]'
+request POST "$BASE_URL/pixel" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-pixel","layerID":"'"$LAYER_ID"'","x":48,"y":48,"color":"#FF9EE0"}' | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/sample?x=48&y=48" | assert_json 'j["ok"] is True and j["rgba"]["r"] == 255 and j["rgba"]["g"] == 158 and j["rgba"]["b"] == 224'
+request POST "$BASE_URL/layer/visibility" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-hide","id":"'"$LAYER_ID"'","visible":false}' | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/sample?x=48&y=48" | assert_json 'j["ok"] is True and j["rgba"]["r"] == 255 and j["rgba"]["g"] == 255 and j["rgba"]["b"] == 255'
+request POST "$BASE_URL/undo" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-undo"}' | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/sample?x=48&y=48" | assert_json 'j["ok"] is True and j["rgba"]["r"] == 255 and j["rgba"]["g"] == 158 and j["rgba"]["b"] == 224'
+request POST "$BASE_URL/layer/opacity" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-opacity","id":"'"$LAYER_ID"'","opacity":0.75}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/layer/blend" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-blend","id":"'"$LAYER_ID"'","blend":"normal"}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/layer/reorder" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-reorder","id":"'"$LAYER_ID"'","toIndex":0}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/layer/lock" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-lock","id":"'"$LAYER_ID"'","locked":true}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/pixel" '{"author":"codex","layerID":"'"$LAYER_ID"'","x":49,"y":48,"color":"#7FFFD4"}' 400 | assert_json 'j["ok"] is False and j["error"]["code"] == "layer_locked"'
+request POST "$BASE_URL/layer/lock" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-unlock","id":"'"$LAYER_ID"'","locked":false}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/layer/activate" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-activate","id":"base"}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/layer/delete" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-delete","id":"'"$LAYER_ID"'"}' | assert_json 'j["ok"] is True'
 
 log "clear"
 request POST "$BASE_URL/clear" "{\"author\":\"codex\",\"idempotencyKey\":\"smoke-$RUN_ID-clear\",\"color\":\"#FFFFFF\"}" | assert_json 'j["ok"] is True'

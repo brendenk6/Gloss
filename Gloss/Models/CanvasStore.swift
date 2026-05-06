@@ -5,150 +5,115 @@ import Observation
 
 /// The single source of truth for the Gloss canvas.
 ///
-/// Owns a CGContext (sRGB premultiplied RGBA). All mutations route through
-/// `apply(_:)` on @MainActor — CGContext is not thread-safe and we don't try
-/// to make it so. Snapshots return a cached CGImage that's invalidated on
-/// every mutation, so SwiftUI views can observe `revision` and refresh cheaply.
+/// As of v1.2, CanvasStore owns a `LayerStack` (one CGContext per layer, all
+/// sRGB premultiplied RGBA, top-left origin). `apply(_:)` resolves the target
+/// layer from `layerID` (missing = active; explicit ID auto-creates only for
+/// the known author patterns) and routes draws to that layer's context.
+///
+/// `currentImage`, `snapshot(...)`, and `sample(at:)` always read the
+/// composited stack — never a single layer — so /sample, /canvas.png,
+/// /canvas.ascii, and /region.png see what Brenden sees on screen.
+///
+/// Undo/redo snapshots the entire layer stack (per-layer pixels, ordering,
+/// visibility, opacity, blend, lock state, active layer). Restoring only the
+/// composite would silently break layers.
 @MainActor
 @Observable
 public final class CanvasStore {
 
     // MARK: - Configuration
 
-    public private(set) var width: Int
-    public private(set) var height: Int
+    public private(set) var stack: LayerStack
+    public var width: Int { stack.width }
+    public var height: Int { stack.height }
 
-    /// Bumped on every mutation. SwiftUI views observe this and pull a fresh
-    /// snapshot through `currentImage`.
     public private(set) var revision: Int = 0
-
-    /// Recent commands for the chrome overlay. Capped at 32.
     public private(set) var lastCommands: [LastCommandSummary] = []
-
-    /// Last cursor position per author, for the floating "X was here" tags.
     public private(set) var authorCursors: [String: GlossPoint] = [:]
 
-    /// Idempotency cache. Maps key → revision at which it was applied. ~256 entries.
     private var idempotencyCache: [String: Int] = [:]
     private var idempotencyKeyOrder: [String] = []
     private let idempotencyCacheCap = 256
 
-    /// Undo stack: list of CGImage snapshots taken before each mutation.
-    /// Kept short to avoid memory blowup. ~32 entries.
-    private var undoStack: [(image: CGImage, summary: LastCommandSummary)] = []
-    private var redoStack: [(image: CGImage, summary: LastCommandSummary)] = []
+    private var undoStack: [(snapshot: LayerStackSnapshot, summary: LastCommandSummary)] = []
+    private var redoStack: [(snapshot: LayerStackSnapshot, summary: LastCommandSummary)] = []
     private let undoCap = 32
 
-    // MARK: - Backing storage
-
-    private var context: CGContext
-    private var cachedImage: CGImage?
-
-    /// Public read-only access to the current image. Cached; recomputed on revision change.
-    public var currentImage: CGImage {
-        if let cached = cachedImage { return cached }
-        let img = context.makeImage()!
-        cachedImage = img
-        return img
-    }
+    /// Cached composite for SwiftUI binding. Refreshed on revision change.
+    public var currentImage: CGImage { stack.compositeImage }
 
     // MARK: - Init
 
-    public init(width: Int = 1024, height: Int = 1024, background: GlossColor = GlossColor(r: 1, g: 1, b: 1)) {
-        self.width = width
-        self.height = height
-        self.context = Self.makeContext(width: width, height: height)
-        self.fillBackground(background)
-        self.cachedImage = self.context.makeImage()
-    }
-
-    private static func makeContext(width: Int, height: Int) -> CGContext {
-        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        guard let ctx = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: cs,
-            bitmapInfo: bitmapInfo
-        ) else {
-            fatalError("Gloss: failed to create CGContext at \(width)x\(height)")
-        }
-        // Top-left origin to match Apple imaging convention used in the API spec.
-        ctx.translateBy(x: 0, y: CGFloat(height))
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.setShouldAntialias(true)
-        ctx.setAllowsAntialiasing(true)
-        ctx.interpolationQuality = .high
-        return ctx
+    public init(width: Int = 1024, height: Int = 1024,
+                background: GlossColor = GlossColor(r: 1, g: 1, b: 1)) {
+        self.stack = LayerStack(width: width, height: height, background: background)
     }
 
     private static func validDirtyRect(_ rect: CGRect?) -> CGRect? {
         guard let rect else { return nil }
         let standardized = rect.standardized
-        guard !standardized.isNull, !standardized.isInfinite, !standardized.isEmpty else {
-            return nil
-        }
+        guard !standardized.isNull, !standardized.isInfinite, !standardized.isEmpty else { return nil }
         guard standardized.origin.x.isFinite,
               standardized.origin.y.isFinite,
               standardized.size.width.isFinite,
-              standardized.size.height.isFinite else {
-            return nil
-        }
+              standardized.size.height.isFinite else { return nil }
         return standardized
-    }
-
-    private func fillBackground(_ color: GlossColor) {
-        context.saveGState()
-        context.setFillColor(color.cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.restoreGState()
     }
 
     // MARK: - Public command surface
 
-    /// Apply a command. Mutations bump revision and invalidate snapshots.
-    /// Returns CommandResult including dirtyRect (best-effort).
     @discardableResult
     public func apply(_ command: DrawCommand) throws -> CommandResult {
-        // Idempotency
         if let key = command.idempotencyKey, let priorRev = idempotencyCache[key] {
             return CommandResult(revision: priorRev, dirtyRect: nil, deduped: true)
         }
 
-        // Snapshot for undo BEFORE mutating (skip on undo/redo themselves).
         let isHistoryOp: Bool = {
             if case .undo = command { return true }
             if case .redo = command { return true }
             return false
         }()
+        let mutatesPixelsOrStack: Bool = {
+            switch command {
+            case .stroke, .shape, .text, .image, .path, .pixel, .pixels, .clear, .resize, .canvasNew,
+                 .layerCreate, .layerDelete, .layerReorder, .layerVisibility, .layerOpacity, .layerBlend:
+                return true
+            case .layerLock, .layerActivate, .undo, .redo:
+                return false
+            }
+        }()
 
-        var snapshotForUndo: CGImage? = nil
-        if !isHistoryOp {
-            snapshotForUndo = context.makeImage()
-        }
+        let snapshotForUndo: LayerStackSnapshot? = (mutatesPixelsOrStack && !isHistoryOp)
+            ? stack.snapshot()
+            : nil
 
         let dirty: CGRect?
         switch command {
-        case .stroke(let p):    dirty = drawStroke(p)
-        case .shape(let p):     dirty = drawShape(p)
-        case .text(let p):      dirty = drawText(p)
-        case .image(let p):     dirty = drawImage(p)
-        case .path(let p):      dirty = drawPath(p)
-        case .pixel(let p):     dirty = drawPixel(p)
-        case .pixels(let p):    dirty = drawPixels(p)
-        case .clear(let p):     dirty = drawClear(p)
+        case .stroke(let p):    dirty = try drawStroke(p)
+        case .shape(let p):     dirty = try drawShape(p)
+        case .text(let p):      dirty = try drawText(p)
+        case .image(let p):     dirty = try drawImage(p)
+        case .path(let p):      dirty = try drawPath(p)
+        case .pixel(let p):     dirty = try drawPixel(p)
+        case .pixels(let p):    dirty = try drawPixels(p)
+        case .clear(let p):     dirty = try drawClear(p)
         case .undo:             dirty = performUndo()
         case .redo:             dirty = performRedo()
         case .resize(let p):    dirty = performResize(p)
+        case .canvasNew(let p): dirty = performCanvasNew(p)
+        case .layerCreate(let p):     dirty = try doLayerCreate(p)
+        case .layerDelete(let p):     dirty = try doLayerDelete(p)
+        case .layerReorder(let p):    dirty = try doLayerReorder(p)
+        case .layerVisibility(let p): dirty = try doLayerVisibility(p)
+        case .layerOpacity(let p):    dirty = try doLayerOpacity(p)
+        case .layerBlend(let p):      dirty = try doLayerBlend(p)
+        case .layerLock(let p):       dirty = try doLayerLock(p)
+        case .layerActivate(let p):   dirty = try doLayerActivate(p)
         }
 
         revision += 1
-        cachedImage = nil
+        stack.invalidateComposite()
 
-        // Update lastCommands log (cap 32, newest first)
         let summary = LastCommandSummary(
             revision: revision,
             kind: command.displayKind,
@@ -158,12 +123,10 @@ public final class CanvasStore {
         lastCommands.insert(summary, at: 0)
         if lastCommands.count > 32 { lastCommands.removeLast(lastCommands.count - 32) }
 
-        // Update author cursor based on last-touch point
         if let author = command.author, let cursor = lastCursor(for: command) {
             authorCursors[author] = cursor
         }
 
-        // Idempotency record
         if let key = command.idempotencyKey {
             idempotencyCache[key] = revision
             idempotencyKeyOrder.append(key)
@@ -173,19 +136,19 @@ public final class CanvasStore {
             }
         }
 
-        // Undo stack push (after we know mutation succeeded)
         if let snap = snapshotForUndo {
             undoStack.append((snap, summary))
             if undoStack.count > undoCap { undoStack.removeFirst() }
-            // Any new mutation invalidates redo
             redoStack.removeAll()
         }
 
-        return CommandResult(revision: revision, dirtyRect: Self.validDirtyRect(dirty).map(GlossRect.init), deduped: false)
+        return CommandResult(
+            revision: revision,
+            dirtyRect: Self.validDirtyRect(dirty).map(GlossRect.init),
+            deduped: false
+        )
     }
 
-    /// Snapshot the whole canvas, optionally downscaled to fit within maxDim
-    /// on the longest side. Returns a CGImage in sRGB.
     public func snapshot(maxDim: Int? = nil) -> CGImage {
         let img = currentImage
         guard let maxDim, maxDim > 0, maxDim < max(width, height) else { return img }
@@ -194,13 +157,14 @@ public final class CanvasStore {
         let outH = max(1, Int((CGFloat(height) * scale).rounded()))
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        guard let ctx = CGContext(data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0, space: cs, bitmapInfo: bitmapInfo) else { return img }
+        guard let ctx = CGContext(data: nil, width: outW, height: outH,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: cs, bitmapInfo: bitmapInfo) else { return img }
         ctx.interpolationQuality = .high
         ctx.draw(img, in: CGRect(x: 0, y: 0, width: outW, height: outH))
         return ctx.makeImage() ?? img
     }
 
-    /// Snapshot a specific region at native or scaled resolution.
     public func snapshot(region: CGRect, scale: CGFloat = 1) -> CGImage? {
         let bounded = region.intersection(CGRect(x: 0, y: 0, width: width, height: height))
         guard !bounded.isEmpty else { return nil }
@@ -208,9 +172,10 @@ public final class CanvasStore {
         let outH = max(1, Int((bounded.height * scale).rounded()))
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        guard let ctx = CGContext(data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0, space: cs, bitmapInfo: bitmapInfo) else { return nil }
+        guard let ctx = CGContext(data: nil, width: outW, height: outH,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: cs, bitmapInfo: bitmapInfo) else { return nil }
         ctx.interpolationQuality = .high
-        // Translate so we render the requested region into the output image.
         let drawRect = CGRect(
             x: -bounded.minX * scale,
             y: -(CGFloat(height) - bounded.maxY) * scale,
@@ -221,33 +186,10 @@ public final class CanvasStore {
         return ctx.makeImage()
     }
 
-    /// Sample the pixel at the given coordinate. Top-left origin, y down.
     public func sample(at point: CGPoint) -> RGBA? {
-        let px = Int(point.x.rounded())
-        let py = Int(point.y.rounded())
-        guard px >= 0, px < width, py >= 0, py < height else { return nil }
-        guard let data = context.data else { return nil }
-        let bytesPerRow = context.bytesPerRow
-        let ptr = data.assumingMemoryBound(to: UInt8.self)
-        let offset = py * bytesPerRow + px * 4
-        let r = ptr[offset + 0]
-        let g = ptr[offset + 1]
-        let b = ptr[offset + 2]
-        let a = ptr[offset + 3]
-        // Premultiplied → straight (display-correct)
-        if a == 0 {
-            return RGBA(r: 0, g: 0, b: 0, a: 0)
-        }
-        let af = Double(a) / 255
-        return RGBA(
-            r: Int(round(min(255, Double(r) / af))),
-            g: Int(round(min(255, Double(g) / af))),
-            b: Int(round(min(255, Double(b) / af))),
-            a: Int(a)
-        )
+        stack.sampleComposite(at: point)
     }
 
-    /// Public state envelope for /state.
     public var state: CanvasState {
         CanvasState(
             width: width,
@@ -258,34 +200,129 @@ public final class CanvasStore {
         )
     }
 
-    // MARK: - Drawing implementations
+    public var layerState: LayerStackState { stack.state }
 
-    private func drawStroke(_ p: StrokePayload) -> CGRect {
-        let cgPoints = p.points.map(\.cgPoint)
-        let path = StrokeSmoother.smoothPath(
-            points: cgPoints,
-            tension: 0.5,
-            simplify: p.simplify.map { CGFloat($0) }
-        )
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setBlendMode(p.blend.cgBlend)
-        let baseAlpha = p.color.a * p.opacity
-        let strokeColor = CGColor(srgbRed: p.color.r, green: p.color.g, blue: p.color.b, alpha: baseAlpha)
-        context.setStrokeColor(strokeColor)
-        context.setLineWidth(p.width)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-        context.addPath(path)
-        context.strokePath()
-        return path.boundingBoxOfPath.insetBy(dx: -p.width, dy: -p.width)
+    // MARK: - Layer command implementations
+
+    private func doLayerCreate(_ p: LayerCreatePayload) throws -> CGRect {
+        _ = try stack.createLayer(p)
+        return CGRect(x: 0, y: 0, width: width, height: height)
     }
 
-    private func drawShape(_ p: ShapePayload) -> CGRect {
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setBlendMode(p.blend.cgBlend)
-        context.setAlpha(p.opacity)
+    private func doLayerDelete(_ p: LayerDeletePayload) throws -> CGRect {
+        try stack.deleteLayer(id: p.id)
+        return CGRect(x: 0, y: 0, width: width, height: height)
+    }
+
+    private func doLayerReorder(_ p: LayerReorderPayload) throws -> CGRect {
+        try stack.reorderLayer(id: p.id, to: p.toIndex)
+        return CGRect(x: 0, y: 0, width: width, height: height)
+    }
+
+    private func doLayerVisibility(_ p: LayerVisibilityPayload) throws -> CGRect {
+        try stack.setVisibility(id: p.id, visible: p.visible)
+        return CGRect(x: 0, y: 0, width: width, height: height)
+    }
+
+    private func doLayerOpacity(_ p: LayerOpacityPayload) throws -> CGRect {
+        try stack.setOpacity(id: p.id, opacity: p.opacity)
+        return CGRect(x: 0, y: 0, width: width, height: height)
+    }
+
+    private func doLayerBlend(_ p: LayerBlendPayload) throws -> CGRect {
+        try stack.setBlend(id: p.id, blend: p.blend)
+        return CGRect(x: 0, y: 0, width: width, height: height)
+    }
+
+    private func doLayerLock(_ p: LayerLockPayload) throws -> CGRect {
+        try stack.setLocked(id: p.id, locked: p.locked)
+        return .null
+    }
+
+    private func doLayerActivate(_ p: LayerActivatePayload) throws -> CGRect {
+        try stack.setActive(id: p.id)
+        return .null
+    }
+
+    // MARK: - Drawing implementations
+
+    private func drawStroke(_ p: StrokePayload) throws -> CGRect {
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
+        let ctx = target.context
+
+        // Validate pressures length if provided.
+        if let pressures = p.pressures, pressures.count != p.points.count {
+            throw GlossError.bad("StrokePayload.pressures.count must equal points.count when provided.")
+        }
+
+        let brush = p.brush ?? .round
+        let taper = p.taper ?? .none
+        let usesEngine = brush != .round
+            || (p.pressures != nil)
+            || (taper != .none)
+
+        if usesEngine {
+            // Smooth/flatten first via StrokeSmoother for visual consistency.
+            let cgPoints = p.points.map(\.cgPoint)
+            let path = StrokeSmoother.smoothPath(
+                points: cgPoints,
+                tension: 0.5,
+                simplify: p.simplify.map { CGFloat($0) }
+            )
+            let flattened = flattenCGPath(path)
+            let request = BrushEngine.StrokeRequest(
+                points: flattened,
+                baseWidth: p.width,
+                color: p.color,
+                opacity: p.opacity,
+                blend: p.blend,
+                brush: brush,
+                brushAngle: p.brushAngle ?? 0,
+                pressures: p.pressures,
+                taper: taper,
+                seed: BrushEngine.seed(
+                    idempotencyKey: p.idempotencyKey,
+                    author: p.author,
+                    layerID: target.id,
+                    fields: ["stroke", brush.rawValue, p.color.toHex(),
+                             String(format: "%.2f", p.width)]
+                ),
+                canvasWidth: width,
+                canvasHeight: height
+            )
+            let bbox = BrushEngine.render(into: ctx, request: request)
+            let pad = max(2, p.width * 1.2)
+            return bbox.insetBy(dx: -pad, dy: -pad)
+        } else {
+            let cgPoints = p.points.map(\.cgPoint)
+            let path = StrokeSmoother.smoothPath(
+                points: cgPoints,
+                tension: 0.5,
+                simplify: p.simplify.map { CGFloat($0) }
+            )
+            ctx.saveGState()
+            defer { ctx.restoreGState() }
+            ctx.setBlendMode(p.blend.cgBlend)
+            let baseAlpha = p.color.a * p.opacity
+            let strokeColor = CGColor(srgbRed: p.color.r, green: p.color.g,
+                                      blue: p.color.b, alpha: baseAlpha)
+            ctx.setStrokeColor(strokeColor)
+            ctx.setLineWidth(p.width)
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            ctx.addPath(path)
+            ctx.strokePath()
+            return path.boundingBoxOfPath.insetBy(dx: -p.width, dy: -p.width)
+        }
+    }
+
+    private func drawShape(_ p: ShapePayload) throws -> CGRect {
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
+        let ctx = target.context
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setBlendMode(p.blend.cgBlend)
+        ctx.setAlpha(p.opacity)
 
         let path = CGMutablePath()
         var bounds: CGRect = .null
@@ -308,23 +345,25 @@ public final class CanvasStore {
         }
 
         if let fill = p.fill {
-            context.setFillColor(fill.cgColor)
-            context.addPath(path)
-            context.fillPath()
+            ctx.setFillColor(fill.cgColor)
+            ctx.addPath(path)
+            ctx.fillPath()
         }
         if let stroke = p.stroke {
-            context.setStrokeColor(stroke.cgColor)
-            context.setLineWidth(p.strokeWidth ?? 2)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-            context.addPath(path)
-            context.strokePath()
+            ctx.setStrokeColor(stroke.cgColor)
+            ctx.setLineWidth(p.strokeWidth ?? 2)
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            ctx.addPath(path)
+            ctx.strokePath()
         }
         let pad = max(2, p.strokeWidth ?? 0)
         return bounds.insetBy(dx: -pad, dy: -pad)
     }
 
-    private func drawText(_ p: TextPayload) -> CGRect {
+    private func drawText(_ p: TextPayload) throws -> CGRect {
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
+        let ctx = target.context
         let weight: NSFont.Weight = {
             switch (p.weight ?? "regular").lowercased() {
             case "thin": return .thin
@@ -351,36 +390,51 @@ public final class CanvasStore {
         let attr = NSAttributedString(string: p.string, attributes: attrs)
         let size = attr.size()
 
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setBlendMode(p.blend.cgBlend)
-        context.setAlpha(p.opacity)
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setBlendMode(p.blend.cgBlend)
+        ctx.setAlpha(p.opacity)
 
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
         attr.draw(at: CGPoint(x: p.x, y: p.y))
         return CGRect(x: p.x, y: p.y, width: size.width, height: size.height)
     }
 
-    private func drawImage(_ p: ImagePayload) -> CGRect {
+    private func drawImage(_ p: ImagePayload) throws -> CGRect {
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
+        let ctx = target.context
         guard let data = Data(base64Encoded: p.pngBase64),
               let provider = CGDataProvider(data: data as CFData),
-              let img = CGImage(pngDataProviderSource: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) else {
+              let img = CGImage(pngDataProviderSource: provider, decode: nil,
+                                shouldInterpolate: true, intent: .defaultIntent) else {
             return .null
         }
         let drawW = p.w ?? Double(img.width)
         let drawH = p.h ?? Double(img.height)
         let rect = CGRect(x: p.x, y: p.y, width: drawW, height: drawH)
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setBlendMode(p.blend.cgBlend)
-        context.setAlpha(p.opacity)
-        context.draw(img, in: rect)
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setBlendMode(p.blend.cgBlend)
+        ctx.setAlpha(p.opacity)
+        ctx.draw(img, in: rect)
         return rect
     }
 
-    private func drawPath(_ p: PathPayload) -> CGRect {
+    private func drawPath(_ p: PathPayload) throws -> CGRect {
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
+        let ctx = target.context
+
+        if let pressures = p.pressures {
+            // Pressures on path require a flattened geometry. We support stroke
+            // pressures only; fill ignores them. Validate we have at least 2
+            // ops and that pressures.count is sane.
+            guard pressures.count >= 2 else {
+                throw GlossError.bad("PathPayload.pressures must have at least 2 entries.")
+            }
+        }
+
         let path = CGMutablePath()
         for op in p.ops {
             switch op {
@@ -405,52 +459,84 @@ public final class CanvasStore {
         }
         guard !path.isEmpty else { return .null }
 
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setBlendMode(p.blend.cgBlend)
-        context.setAlpha(p.opacity)
+        let strokeBrush = p.brush ?? .round
+        let taper = p.taper ?? .none
+        let useEngine = (p.color != nil) && (
+            strokeBrush != .round
+            || (p.pressures != nil)
+            || (taper != .none)
+        )
+
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setBlendMode(p.blend.cgBlend)
+        ctx.setAlpha(p.opacity)
 
         if let fill = p.fill {
-            context.setFillColor(fill.cgColor)
-            context.addPath(path)
-            // Use even-odd to allow self-intersecting polygons to fill predictably.
-            context.fillPath(using: .evenOdd)
+            ctx.setFillColor(fill.cgColor)
+            ctx.addPath(path)
+            ctx.fillPath(using: .evenOdd)
         }
 
-        if let strokeColor = p.color {
-            context.setStrokeColor(strokeColor.cgColor)
-            context.setLineWidth(p.strokeWidth ?? 2)
-            context.setLineCap(p.lineCap?.cgCap ?? .round)
-            context.setLineJoin(p.lineJoin?.cgJoin ?? .round)
-            if let miter = p.miterLimit { context.setMiterLimit(miter) }
+        if useEngine, let strokeColor = p.color {
+            // Flatten the path to evenly-sampled points and dispatch to the brush engine.
+            let flattened = flattenCGPath(path)
+            let request = BrushEngine.StrokeRequest(
+                points: flattened,
+                baseWidth: p.strokeWidth ?? 2,
+                color: strokeColor,
+                opacity: 1,                  // already applied via setAlpha above
+                blend: p.blend,
+                brush: strokeBrush,
+                brushAngle: p.brushAngle ?? 0,
+                pressures: p.pressures.flatMap { remap(pressures: $0, toCount: flattened.count) },
+                taper: taper,
+                seed: BrushEngine.seed(
+                    idempotencyKey: p.idempotencyKey,
+                    author: p.author,
+                    layerID: target.id,
+                    fields: ["path", strokeBrush.rawValue, strokeColor.toHex(),
+                             String(format: "%.2f", p.strokeWidth ?? 2)]
+                ),
+                canvasWidth: width,
+                canvasHeight: height
+            )
+            let bbox = BrushEngine.render(into: ctx, request: request)
+            let pad = max(2, (p.strokeWidth ?? 2) * 1.2)
+            return bbox.insetBy(dx: -pad, dy: -pad)
+        } else if let strokeColor = p.color {
+            ctx.setStrokeColor(strokeColor.cgColor)
+            ctx.setLineWidth(p.strokeWidth ?? 2)
+            ctx.setLineCap(p.lineCap?.cgCap ?? .round)
+            ctx.setLineJoin(p.lineJoin?.cgJoin ?? .round)
+            if let miter = p.miterLimit { ctx.setMiterLimit(miter) }
             if let dash = p.dash, !dash.isEmpty {
                 let lengths = dash.map { CGFloat($0) }
-                context.setLineDash(phase: 0, lengths: lengths)
+                ctx.setLineDash(phase: 0, lengths: lengths)
             }
-            context.addPath(path)
-            context.strokePath()
+            ctx.addPath(path)
+            ctx.strokePath()
         }
 
         let pad = max(2, p.strokeWidth ?? 0)
         return path.boundingBoxOfPath.insetBy(dx: -pad, dy: -pad)
     }
 
-    /// Set a single pixel without antialiasing. Writes directly to the bitmap
-    /// buffer so it's exact even for sub-pixel-aligned color values.
-    private func drawPixel(_ p: PixelPayload) -> CGRect {
+    private func drawPixel(_ p: PixelPayload) throws -> CGRect {
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
         guard p.x >= 0, p.x < width, p.y >= 0, p.y < height else { return .null }
-        writePixel(x: p.x, y: p.y, color: p.color, blend: p.blend)
+        writePixel(into: target.context, x: p.x, y: p.y, color: p.color, blend: p.blend)
         return CGRect(x: p.x, y: p.y, width: 1, height: 1)
     }
 
-    /// Batch pixel set. Each pixel may carry its own color or fall back to defaultColor.
-    private func drawPixels(_ p: PixelsPayload) -> CGRect {
+    private func drawPixels(_ p: PixelsPayload) throws -> CGRect {
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
         var minX = Int.max, minY = Int.max, maxX = Int.min, maxY = Int.min
         let fallback = p.defaultColor
         for px in p.pixels {
             let color = px.color ?? fallback ?? GlossColor(r: 0, g: 0, b: 0)
             guard px.x >= 0, px.x < width, px.y >= 0, px.y < height else { continue }
-            writePixel(x: px.x, y: px.y, color: color, blend: p.blend)
+            writePixel(into: target.context, x: px.x, y: px.y, color: color, blend: p.blend)
             if px.x < minX { minX = px.x }
             if px.y < minY { minY = px.y }
             if px.x > maxX { maxX = px.x }
@@ -460,11 +546,10 @@ public final class CanvasStore {
         return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
     }
 
-    /// Direct buffer write bypassing CGContext. The backing buffer already
-    /// matches the public top-left coordinate convention used by sample(at:).
-    private func writePixel(x: Int, y: Int, color: GlossColor, blend: GlossBlend) {
-        guard let data = context.data else { return }
-        let bytesPerRow = context.bytesPerRow
+    private func writePixel(into ctx: CGContext, x: Int, y: Int,
+                            color: GlossColor, blend: GlossBlend) {
+        guard let data = ctx.data else { return }
+        let bytesPerRow = ctx.bytesPerRow
         let offset = y * bytesPerRow + x * 4
         let ptr = data.assumingMemoryBound(to: UInt8.self)
 
@@ -474,7 +559,6 @@ public final class CanvasStore {
         let dstB = ptr[offset + 2]
         let dstA = ptr[offset + 3]
 
-        // Premultiplied source channels
         let srcR = UInt8(round(color.r * alpha * 255))
         let srcG = UInt8(round(color.g * alpha * 255))
         let srcB = UInt8(round(color.b * alpha * 255))
@@ -496,15 +580,12 @@ public final class CanvasStore {
                 ptr[offset + 3] = 255
                 return
             }
-            // Source-over: out = src + dst*(1-src.a)
             let inv = 1.0 - alpha
             ptr[offset + 0] = UInt8(min(255, Int(round(Double(srcR) + Double(dstR) * inv))))
             ptr[offset + 1] = UInt8(min(255, Int(round(Double(srcG) + Double(dstG) * inv))))
             ptr[offset + 2] = UInt8(min(255, Int(round(Double(srcB) + Double(dstB) * inv))))
             ptr[offset + 3] = UInt8(min(255, Int(round(Double(srcA) + Double(dstA) * inv))))
         default:
-            // Fall back to source-over for non-normal blends in the fast path.
-            // For exotic blends call /pixel via /shape rect 1x1 with blend instead.
             let inv = 1.0 - alpha
             ptr[offset + 0] = UInt8(min(255, Int(round(Double(srcR) + Double(dstR) * inv))))
             ptr[offset + 1] = UInt8(min(255, Int(round(Double(srcG) + Double(dstG) * inv))))
@@ -513,63 +594,60 @@ public final class CanvasStore {
         }
     }
 
-    private func drawClear(_ p: ClearPayload) -> CGRect {
+    private func drawClear(_ p: ClearPayload) throws -> CGRect {
+        // A targeted clear with an explicit layerID clears just that layer; a
+        // bare clear (no layerID) wipes the active layer.
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
         let color = p.color ?? GlossColor(r: 1, g: 1, b: 1)
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setBlendMode(.copy)
-        context.setFillColor(color.cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let ctx = target.context
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setBlendMode(.copy)
+        ctx.setFillColor(color.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         return CGRect(x: 0, y: 0, width: width, height: height)
     }
 
     private func performUndo() -> CGRect {
         guard let entry = undoStack.popLast() else { return .null }
-        // Push current state to redo before reverting.
-        if let curr = context.makeImage() {
-            redoStack.append((curr, entry.summary))
-            if redoStack.count > undoCap { redoStack.removeFirst() }
-        }
-        // Restore the snapshot.
-        replaceContents(with: entry.image)
+        let currentSnap = stack.snapshot()
+        redoStack.append((currentSnap, entry.summary))
+        if redoStack.count > undoCap { redoStack.removeFirst() }
+        stack.restore(entry.snapshot)
         return CGRect(x: 0, y: 0, width: width, height: height)
     }
 
     private func performRedo() -> CGRect {
         guard let entry = redoStack.popLast() else { return .null }
-        if let curr = context.makeImage() {
-            undoStack.append((curr, entry.summary))
-            if undoStack.count > undoCap { undoStack.removeFirst() }
-        }
-        replaceContents(with: entry.image)
+        let currentSnap = stack.snapshot()
+        undoStack.append((currentSnap, entry.summary))
+        if undoStack.count > undoCap { undoStack.removeFirst() }
+        stack.restore(entry.snapshot)
         return CGRect(x: 0, y: 0, width: width, height: height)
     }
 
     private func performResize(_ p: ResizePayload) -> CGRect {
-        let newCtx = Self.makeContext(width: p.width, height: p.height)
-        if p.preserveContents, let img = context.makeImage() {
-            // Stretch existing contents into the new canvas.
-            newCtx.draw(img, in: CGRect(x: 0, y: 0, width: p.width, height: p.height))
+        if p.preserveContents {
+            stack.resizeAll(width: p.width, height: p.height)
         } else {
-            newCtx.setFillColor(GlossColor(r: 1, g: 1, b: 1).cgColor)
-            newCtx.fill(CGRect(x: 0, y: 0, width: p.width, height: p.height))
+            stack.reset(width: p.width, height: p.height,
+                        background: GlossColor(r: 1, g: 1, b: 1))
         }
-        self.context = newCtx
-        self.width = p.width
-        self.height = p.height
-        // Resize invalidates undo/redo because dimensions changed.
         undoStack.removeAll()
         redoStack.removeAll()
         return CGRect(x: 0, y: 0, width: p.width, height: p.height)
     }
 
-    private func replaceContents(with image: CGImage) {
-        // Wipe + redraw the snapshot.
-        context.saveGState()
-        context.setBlendMode(.copy)
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        context.restoreGState()
+    private func performCanvasNew(_ p: CanvasNewPayload) -> CGRect {
+        let bg = p.background ?? GlossColor(r: 1, g: 1, b: 1)
+        if p.preserveLayers {
+            stack.resizeAll(width: p.width, height: p.height)
+        } else {
+            stack.reset(width: p.width, height: p.height, background: bg)
+        }
+        undoStack.removeAll()
+        redoStack.removeAll()
+        return CGRect(x: 0, y: 0, width: p.width, height: p.height)
     }
 
     private func lastCursor(for command: DrawCommand) -> GlossPoint? {
@@ -579,7 +657,6 @@ public final class CanvasStore {
         case .text(let p): return GlossPoint(x: p.x, y: p.y)
         case .image(let p): return GlossPoint(x: p.x, y: p.y)
         case .path(let p):
-            // Return the last absolute point in the ops list
             for op in p.ops.reversed() {
                 switch op {
                 case .move(let x, let y): return GlossPoint(x: x, y: y)
@@ -592,7 +669,121 @@ public final class CanvasStore {
             return nil
         case .pixel(let p): return GlossPoint(x: Double(p.x), y: Double(p.y))
         case .pixels(let p): return p.pixels.last.map { GlossPoint(x: Double($0.x), y: Double($0.y)) }
-        case .clear, .undo, .redo, .resize: return nil
+        case .clear, .undo, .redo, .resize, .canvasNew,
+             .layerCreate, .layerDelete, .layerReorder,
+             .layerVisibility, .layerOpacity, .layerBlend,
+             .layerLock, .layerActivate:
+            return nil
         }
+    }
+
+    // MARK: - Path flattening helpers
+
+    private func flattenCGPath(_ path: CGPath) -> [CGPoint] {
+        var out: [CGPoint] = []
+        let stepRoughly: CGFloat = 1.0
+        // CoreGraphics doesn't expose path flattening directly; we sample by
+        // iterating elements and chord-flattening each segment.
+        let bezier = NSBezierPath(cgPath: path)
+        let total = bezier.elementCount
+        guard total > 0 else { return [] }
+
+        var current = CGPoint.zero
+        for i in 0..<total {
+            var pts = [NSPoint](repeating: .zero, count: 3)
+            let kind = bezier.element(at: i, associatedPoints: &pts)
+            switch kind {
+            case .moveTo:
+                current = pts[0]
+                out.append(current)
+            case .lineTo:
+                let target = pts[0]
+                out.append(contentsOf: linearSamples(from: current, to: target, step: stepRoughly))
+                current = target
+            case .curveTo:
+                let c1 = pts[0], c2 = pts[1], end = pts[2]
+                out.append(contentsOf: cubicSamples(from: current, c1: c1, c2: c2, to: end, step: stepRoughly))
+                current = end
+            case .closePath:
+                if let first = out.first {
+                    out.append(contentsOf: linearSamples(from: current, to: first, step: stepRoughly))
+                    current = first
+                }
+            case .quadraticCurveTo:
+                let cp = pts[0], end = pts[1]
+                out.append(contentsOf: quadSamples(from: current, c: cp, to: end, step: stepRoughly))
+                current = end
+            @unknown default:
+                continue
+            }
+        }
+        return out
+    }
+
+    private func linearSamples(from p0: CGPoint, to p1: CGPoint, step: CGFloat) -> [CGPoint] {
+        let dx = p1.x - p0.x, dy = p1.y - p0.y
+        let dist = hypot(dx, dy)
+        let n = max(1, Int(ceil(dist / max(0.5, step))))
+        var pts: [CGPoint] = []
+        pts.reserveCapacity(n)
+        for i in 1...n {
+            let t = CGFloat(i) / CGFloat(n)
+            pts.append(CGPoint(x: p0.x + dx * t, y: p0.y + dy * t))
+        }
+        return pts
+    }
+
+    private func quadSamples(from p0: CGPoint, c: CGPoint, to p1: CGPoint, step: CGFloat) -> [CGPoint] {
+        let approxLen = hypot(c.x - p0.x, c.y - p0.y) + hypot(p1.x - c.x, p1.y - c.y)
+        let n = max(2, Int(ceil(approxLen / max(0.5, step))))
+        var pts: [CGPoint] = []
+        pts.reserveCapacity(n)
+        for i in 1...n {
+            let t = CGFloat(i) / CGFloat(n)
+            let oneT = 1 - t
+            let x = oneT * oneT * p0.x + 2 * oneT * t * c.x + t * t * p1.x
+            let y = oneT * oneT * p0.y + 2 * oneT * t * c.y + t * t * p1.y
+            pts.append(CGPoint(x: x, y: y))
+        }
+        return pts
+    }
+
+    private func cubicSamples(from p0: CGPoint, c1: CGPoint, c2: CGPoint, to p1: CGPoint, step: CGFloat) -> [CGPoint] {
+        let approxLen = hypot(c1.x - p0.x, c1.y - p0.y)
+            + hypot(c2.x - c1.x, c2.y - c1.y)
+            + hypot(p1.x - c2.x, p1.y - c2.y)
+        let n = max(4, Int(ceil(approxLen / max(0.5, step))))
+        var pts: [CGPoint] = []
+        pts.reserveCapacity(n)
+        for i in 1...n {
+            let t = CGFloat(i) / CGFloat(n)
+            let oneT = 1 - t
+            let x = oneT*oneT*oneT * p0.x
+                  + 3 * oneT*oneT * t * c1.x
+                  + 3 * oneT * t*t * c2.x
+                  + t*t*t * p1.x
+            let y = oneT*oneT*oneT * p0.y
+                  + 3 * oneT*oneT * t * c1.y
+                  + 3 * oneT * t*t * c2.y
+                  + t*t*t * p1.y
+            pts.append(CGPoint(x: x, y: y))
+        }
+        return pts
+    }
+
+    private func remap(pressures: [Double], toCount n: Int) -> [Double]? {
+        guard !pressures.isEmpty, n > 0 else { return nil }
+        if pressures.count == n { return pressures }
+        var out: [Double] = []
+        out.reserveCapacity(n)
+        let m = pressures.count
+        for i in 0..<n {
+            let f = Double(i) * Double(m - 1) / Double(max(1, n - 1))
+            let lo = Int(floor(f))
+            let hi = min(m - 1, lo + 1)
+            let t = f - Double(lo)
+            out.append(pressures[lo] * (1 - t) + pressures[hi] * t)
+        }
+        return out
     }
 }

@@ -42,11 +42,16 @@ struct GlossHTTPResponse {
 @MainActor
 final class ServerIdempotencyCache {
     private var results: [String: CommandResult] = [:]
+    private var layerCreates: [String: (result: CommandResult, layer: GlossLayer)] = [:]
     private var order: [String] = []
     private let cap = 256
 
     func result(for key: String) -> CommandResult? {
         results[key]
+    }
+
+    func layerCreate(for key: String) -> (result: CommandResult, layer: GlossLayer)? {
+        layerCreates[key]
     }
 
     func record(_ result: CommandResult, for key: String?) {
@@ -58,11 +63,19 @@ final class ServerIdempotencyCache {
         while order.count > cap {
             let evicted = order.removeFirst()
             results.removeValue(forKey: evicted)
+            layerCreates.removeValue(forKey: evicted)
         }
+    }
+
+    func recordLayerCreate(_ result: CommandResult, layer: GlossLayer, for key: String?) {
+        record(result, for: key)
+        guard let key, !key.isEmpty else { return }
+        layerCreates[key] = (result, layer)
     }
 
     func clear() {
         results.removeAll()
+        layerCreates.removeAll()
         order.removeAll()
     }
 }
@@ -84,7 +97,13 @@ enum GlossRoutes {
         do {
             switch (method, path) {
             case ("GET", "/state"):
-                return .json(StateEnvelope(state: store.state))
+                return .json(StateEnvelope(state: store.state, layerState: store.layerState))
+
+            case ("GET", "/layers"), ("GET", "/layer/list"):
+                return .json(LayersEnvelope(layerState: store.layerState, revision: store.revision))
+
+            case ("GET", "/canvas/presets"):
+                return .json(CanvasPresetsEnvelope(presets: GlossCanvasPresets.all))
 
             case ("GET", "/canvas.png"), ("GET", "/canvas"):
                 let maxDim = intParam(query, "max_dim") ?? intParam(query, "maxDim")
@@ -171,6 +190,26 @@ enum GlossRoutes {
                 let response = try apply(body: body, inferredType: "resize", store: store, idempotency: idempotency)
                 idempotency.clear()
                 return response
+            case ("POST", "/canvas/new"):
+                let response = try apply(body: body, inferredType: "canvasNew", store: store, idempotency: idempotency)
+                idempotency.clear()
+                return response
+            case ("POST", "/layer/create"):
+                return try applyLayerCreate(body: body, store: store, idempotency: idempotency)
+            case ("POST", "/layer/delete"):
+                return try apply(body: body, inferredType: "layerDelete", store: store, idempotency: idempotency)
+            case ("POST", "/layer/reorder"):
+                return try apply(body: body, inferredType: "layerReorder", store: store, idempotency: idempotency)
+            case ("POST", "/layer/visibility"), ("POST", "/layer/show"), ("POST", "/layer/hide"):
+                return try applyLayerVisibility(body: body, path: path, store: store, idempotency: idempotency)
+            case ("POST", "/layer/opacity"):
+                return try apply(body: body, inferredType: "layerOpacity", store: store, idempotency: idempotency)
+            case ("POST", "/layer/blend"):
+                return try apply(body: body, inferredType: "layerBlend", store: store, idempotency: idempotency)
+            case ("POST", "/layer/lock"):
+                return try apply(body: body, inferredType: "layerLock", store: store, idempotency: idempotency)
+            case ("POST", "/layer/activate"), ("POST", "/layer/active"):
+                return try apply(body: body, inferredType: "layerActivate", store: store, idempotency: idempotency)
 
             default:
                 return .error(code: "not_found", message: "Unknown route: \(method) \(path)", status: 404)
@@ -196,6 +235,76 @@ enum GlossRoutes {
             return .json(CommandEnvelope(result: cached, dedupedByServer: true))
         }
 
+        let result = try store.apply(command)
+        idempotency.record(result, for: command.idempotencyKey)
+        return .json(CommandEnvelope(result: result, dedupedByServer: false))
+    }
+
+    private static func applyLayerCreate(
+        body: Data,
+        store: CanvasStore,
+        idempotency: ServerIdempotencyCache
+    ) throws -> GlossHTTPResponse {
+        let command = try decodeCommand(body: body, inferredType: "layerCreate")
+        guard case .layerCreate = command else {
+            throw GlossError.bad("Expected a layerCreate command.")
+        }
+
+        if let key = command.idempotencyKey, let cached = idempotency.layerCreate(for: key) {
+            return .json(LayerCreateEnvelope(
+                result: cached.result,
+                layer: cached.layer,
+                layerState: store.layerState,
+                dedupedByServer: true
+            ))
+        }
+
+        let existingIDs = Set(store.layerState.layers.map(\.id))
+        let result = try store.apply(command)
+        let createdLayer = store.layerState.layers.first { !existingIDs.contains($0.id) }
+            ?? store.layerState.layers.first { $0.id == store.layerState.activeLayerID }
+            ?? store.layerState.layers.last
+        guard let layer = createdLayer else {
+            throw GlossError.internalError("Layer create succeeded, but no layer is available in state.")
+        }
+        idempotency.recordLayerCreate(result, layer: layer, for: command.idempotencyKey)
+        return .json(LayerCreateEnvelope(
+            result: result,
+            layer: layer,
+            layerState: store.layerState,
+            dedupedByServer: false
+        ))
+    }
+
+    private static func applyLayerVisibility(
+        body: Data,
+        path: String,
+        store: CanvasStore,
+        idempotency: ServerIdempotencyCache
+    ) throws -> GlossHTTPResponse {
+        let inferredType = "layerVisibility"
+        let source = body.isEmpty ? Data("{}".utf8) : body
+        let jsonObject: Any
+        do {
+            jsonObject = try JSONSerialization.jsonObject(with: source)
+        } catch {
+            throw GlossError(code: "bad_json", message: "Invalid JSON body: \(error.localizedDescription)")
+        }
+        guard var object = jsonObject as? [String: Any] else {
+            throw GlossError(code: "bad_json", message: "Expected a JSON object body.")
+        }
+        object["type"] = object["type"] ?? inferredType
+        if path == "/layer/show" {
+            object["visible"] = true
+        } else if path == "/layer/hide" {
+            object["visible"] = false
+        }
+        let normalized = try JSONSerialization.data(withJSONObject: object)
+        let command = try JSONDecoder().decode(DrawCommand.self, from: normalized)
+
+        if let key = command.idempotencyKey, let cached = idempotency.result(for: key) {
+            return .json(CommandEnvelope(result: cached, dedupedByServer: true))
+        }
         let result = try store.apply(command)
         idempotency.record(result, for: command.idempotencyKey)
         return .json(CommandEnvelope(result: result, dedupedByServer: false))
@@ -371,8 +480,8 @@ enum GlossRoutes {
 
     private static func status(for error: GlossError) -> Int {
         switch error.code {
-        case "bad_request", "bad_json": return 400
-        case "not_found": return 404
+        case "bad_request", "bad_json", "layer_locked", "layer_cap": return 400
+        case "not_found", "layer_not_found": return 404
         case "not_implemented": return 501
         default: return 500
         }
@@ -401,14 +510,27 @@ private struct StateEnvelope: Encodable {
     let revision: Int
     let lastCommands: [LastCommandSummary]
     let authorCursors: [String: GlossPoint]
+    let layerState: LayerStackState
 
-    init(state: CanvasState) {
+    init(state: CanvasState, layerState: LayerStackState) {
         self.width = state.width
         self.height = state.height
         self.revision = state.revision
         self.lastCommands = state.lastCommands
         self.authorCursors = state.authorCursors
+        self.layerState = layerState
     }
+}
+
+private struct LayersEnvelope: Encodable {
+    let ok = true
+    let layerState: LayerStackState
+    let revision: Int
+}
+
+private struct CanvasPresetsEnvelope: Encodable {
+    let ok = true
+    let presets: [CanvasPreset]
 }
 
 private struct CommandEnvelope: Encodable {
@@ -423,6 +545,25 @@ private struct CommandEnvelope: Encodable {
         self.dirtyRect = result.dirtyRect
         self.deduped = result.deduped || dedupedByServer
         self.dedupedByServer = dedupedByServer
+    }
+}
+
+private struct LayerCreateEnvelope: Encodable {
+    let ok = true
+    let revision: Int
+    let dirtyRect: GlossRect?
+    let deduped: Bool
+    let dedupedByServer: Bool
+    let layer: GlossLayer
+    let layerState: LayerStackState
+
+    init(result: CommandResult, layer: GlossLayer, layerState: LayerStackState, dedupedByServer: Bool) {
+        self.revision = result.revision
+        self.dirtyRect = result.dirtyRect
+        self.deduped = result.deduped || dedupedByServer
+        self.dedupedByServer = dedupedByServer
+        self.layer = layer
+        self.layerState = layerState
     }
 }
 

@@ -27,54 +27,60 @@ struct ContentView: View {
                 .background(GlossPalette.chrome)
             Divider().background(Color.white.opacity(0.06))
 
-            ZStack {
-                LinearGradient(
-                    colors: [GlossPalette.lavender.opacity(0.25),
-                             GlossPalette.aqua.opacity(0.25),
-                             GlossPalette.glow.opacity(0.25)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
-
+            HStack(spacing: 0) {
                 ZStack {
-                    CanvasView(store: store)
-                        .aspectRatio(CGFloat(store.width) / CGFloat(store.height), contentMode: .fit)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
-                        )
-                        .clipShape(.rect(cornerRadius: 12, style: .continuous))
-                        .shadow(color: .black.opacity(0.4), radius: 24, y: 10)
-                        .padding(28)
-                        .overlay(authorCursorLayer)
-                        .overlay(brushPreviewLayer)
-                        .background(
-                            GeometryReader { geo in
-                                Color.clear.onContinuousHover { phase in
-                                    switch phase {
-                                    case .active(let p):
-                                        let canvasFrame = canvasFrameInside(geo.size)
-                                        if canvasFrame.contains(p) {
-                                            screenHover = p
-                                            hoverPoint = canvasCoord(from: p, frame: canvasFrame)
-                                            if let pt = hoverPoint {
-                                                sampleColor = store.sample(at: pt)
+                    LinearGradient(
+                        colors: [GlossPalette.lavender.opacity(0.25),
+                                 GlossPalette.aqua.opacity(0.25),
+                                 GlossPalette.glow.opacity(0.25)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .ignoresSafeArea()
+
+                    ZStack {
+                        CanvasView(store: store)
+                            .aspectRatio(CGFloat(store.width) / CGFloat(store.height), contentMode: .fit)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                            )
+                            .clipShape(.rect(cornerRadius: 12, style: .continuous))
+                            .shadow(color: .black.opacity(0.4), radius: 24, y: 10)
+                            .padding(28)
+                            .overlay(authorCursorLayer)
+                            .overlay(brushPreviewLayer)
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.onContinuousHover { phase in
+                                        switch phase {
+                                        case .active(let p):
+                                            let canvasFrame = canvasFrameInside(geo.size)
+                                            if canvasFrame.contains(p) {
+                                                screenHover = p
+                                                hoverPoint = canvasCoord(from: p, frame: canvasFrame)
+                                                if let pt = hoverPoint {
+                                                    sampleColor = store.sample(at: pt)
+                                                }
+                                            } else {
+                                                screenHover = nil
+                                                hoverPoint = nil
+                                                sampleColor = nil
                                             }
-                                        } else {
+                                        case .ended:
                                             screenHover = nil
                                             hoverPoint = nil
                                             sampleColor = nil
                                         }
-                                    case .ended:
-                                        screenHover = nil
-                                        hoverPoint = nil
-                                        sampleColor = nil
                                     }
                                 }
-                            }
-                        )
+                            )
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                LayerPanel(store: store)
+                    .frame(width: 240)
             }
         }
         .background(GlossPalette.chrome)

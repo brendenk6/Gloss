@@ -135,6 +135,15 @@ public enum DrawCommand: Codable, Sendable {
     case undo(MetaPayload)
     case redo(MetaPayload)
     case resize(ResizePayload)
+    case canvasNew(CanvasNewPayload)
+    case layerCreate(LayerCreatePayload)
+    case layerDelete(LayerDeletePayload)
+    case layerReorder(LayerReorderPayload)
+    case layerVisibility(LayerVisibilityPayload)
+    case layerOpacity(LayerOpacityPayload)
+    case layerBlend(LayerBlendPayload)
+    case layerLock(LayerLockPayload)
+    case layerActivate(LayerActivatePayload)
 
     // MARK: Common metadata
 
@@ -151,6 +160,15 @@ public enum DrawCommand: Codable, Sendable {
         case .undo(let p): return p.author
         case .redo(let p): return p.author
         case .resize(let p): return p.author
+        case .canvasNew(let p): return p.author
+        case .layerCreate(let p): return p.author
+        case .layerDelete(let p): return p.author
+        case .layerReorder(let p): return p.author
+        case .layerVisibility(let p): return p.author
+        case .layerOpacity(let p): return p.author
+        case .layerBlend(let p): return p.author
+        case .layerLock(let p): return p.author
+        case .layerActivate(let p): return p.author
         }
     }
 
@@ -167,6 +185,15 @@ public enum DrawCommand: Codable, Sendable {
         case .undo(let p): return p.idempotencyKey
         case .redo(let p): return p.idempotencyKey
         case .resize(let p): return p.idempotencyKey
+        case .canvasNew(let p): return p.idempotencyKey
+        case .layerCreate(let p): return p.idempotencyKey
+        case .layerDelete(let p): return p.idempotencyKey
+        case .layerReorder(let p): return p.idempotencyKey
+        case .layerVisibility(let p): return p.idempotencyKey
+        case .layerOpacity(let p): return p.idempotencyKey
+        case .layerBlend(let p): return p.idempotencyKey
+        case .layerLock(let p): return p.idempotencyKey
+        case .layerActivate(let p): return p.idempotencyKey
         }
     }
 
@@ -184,6 +211,15 @@ public enum DrawCommand: Codable, Sendable {
         case .undo: return "undo"
         case .redo: return "redo"
         case .resize: return "resize"
+        case .canvasNew: return "canvasNew"
+        case .layerCreate: return "layerCreate"
+        case .layerDelete: return "layerDelete"
+        case .layerReorder: return "layerReorder"
+        case .layerVisibility: return "layerVisibility"
+        case .layerOpacity: return "layerOpacity"
+        case .layerBlend: return "layerBlend"
+        case .layerLock: return "layerLock"
+        case .layerActivate: return "layerActivate"
         }
     }
 
@@ -207,6 +243,15 @@ public enum DrawCommand: Codable, Sendable {
         case "undo":   self = .undo(try single.decode(MetaPayload.self))
         case "redo":   self = .redo(try single.decode(MetaPayload.self))
         case "resize": self = .resize(try single.decode(ResizePayload.self))
+        case "canvasNew":      self = .canvasNew(try single.decode(CanvasNewPayload.self))
+        case "layerCreate":    self = .layerCreate(try single.decode(LayerCreatePayload.self))
+        case "layerDelete":    self = .layerDelete(try single.decode(LayerDeletePayload.self))
+        case "layerReorder":   self = .layerReorder(try single.decode(LayerReorderPayload.self))
+        case "layerVisibility":self = .layerVisibility(try single.decode(LayerVisibilityPayload.self))
+        case "layerOpacity":   self = .layerOpacity(try single.decode(LayerOpacityPayload.self))
+        case "layerBlend":     self = .layerBlend(try single.decode(LayerBlendPayload.self))
+        case "layerLock":      self = .layerLock(try single.decode(LayerLockPayload.self))
+        case "layerActivate":  self = .layerActivate(try single.decode(LayerActivatePayload.self))
         default:
             throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown command type \(type)"))
         }
@@ -226,6 +271,15 @@ public enum DrawCommand: Codable, Sendable {
         case .undo(let p):   try single.encode(_TaggedEncode(type: "undo",   payload: p))
         case .redo(let p):   try single.encode(_TaggedEncode(type: "redo",   payload: p))
         case .resize(let p): try single.encode(_TaggedEncode(type: "resize", payload: p))
+        case .canvasNew(let p):       try single.encode(_TaggedEncode(type: "canvasNew", payload: p))
+        case .layerCreate(let p):     try single.encode(_TaggedEncode(type: "layerCreate", payload: p))
+        case .layerDelete(let p):     try single.encode(_TaggedEncode(type: "layerDelete", payload: p))
+        case .layerReorder(let p):    try single.encode(_TaggedEncode(type: "layerReorder", payload: p))
+        case .layerVisibility(let p): try single.encode(_TaggedEncode(type: "layerVisibility", payload: p))
+        case .layerOpacity(let p):    try single.encode(_TaggedEncode(type: "layerOpacity", payload: p))
+        case .layerBlend(let p):      try single.encode(_TaggedEncode(type: "layerBlend", payload: p))
+        case .layerLock(let p):       try single.encode(_TaggedEncode(type: "layerLock", payload: p))
+        case .layerActivate(let p):   try single.encode(_TaggedEncode(type: "layerActivate", payload: p))
         }
     }
 }
@@ -242,10 +296,16 @@ public struct StrokePayload: Codable, Sendable {
     public var opacity: Double        // 0…1, multiplies color.a
     public var blend: GlossBlend
     public var simplify: Double?      // optional resample tolerance
+    public var brush: GlossBrushKind?       // default .round
+    public var brushAngle: Double?          // radians, calligraphy nib angle
+    public var pressures: [Double]?         // 0…1, must match points.count if set
+    public var taper: GlossTaper?           // default .none
 
     public init(author: String? = nil, idempotencyKey: String? = nil, layerID: String? = nil,
                 points: [GlossPoint], width: Double, color: GlossColor,
-                opacity: Double = 1, blend: GlossBlend = .normal, simplify: Double? = nil) {
+                opacity: Double = 1, blend: GlossBlend = .normal, simplify: Double? = nil,
+                brush: GlossBrushKind? = nil, brushAngle: Double? = nil,
+                pressures: [Double]? = nil, taper: GlossTaper? = nil) {
         self.author = author
         self.idempotencyKey = idempotencyKey
         self.layerID = layerID
@@ -255,10 +315,15 @@ public struct StrokePayload: Codable, Sendable {
         self.opacity = max(0, min(1, opacity))
         self.blend = blend
         self.simplify = simplify
+        self.brush = brush
+        self.brushAngle = brushAngle
+        self.pressures = pressures
+        self.taper = taper
     }
 
     private enum CodingKeys: String, CodingKey {
         case author, idempotencyKey, layerID, points, width, color, opacity, blend, simplify
+        case brush, brushAngle, pressures, taper
     }
 
     public init(from decoder: Decoder) throws {
@@ -272,6 +337,14 @@ public struct StrokePayload: Codable, Sendable {
         self.opacity = max(0, min(1, try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1))
         self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
         self.simplify = try c.decodeIfPresent(Double.self, forKey: .simplify)
+        self.brush = try c.decodeIfPresent(GlossBrushKind.self, forKey: .brush)
+        self.brushAngle = try c.decodeIfPresent(Double.self, forKey: .brushAngle)
+        if let raw = try c.decodeIfPresent([Double].self, forKey: .pressures) {
+            self.pressures = raw.map { max(0, min(1, $0)) }
+        } else {
+            self.pressures = nil
+        }
+        self.taper = try c.decodeIfPresent(GlossTaper.self, forKey: .taper)
     }
 }
 
@@ -591,6 +664,24 @@ public enum GlossLineJoin: String, Codable, Sendable {
     }
 }
 
+// MARK: - Brush
+
+public enum GlossBrushKind: String, Codable, Sendable {
+    case round
+    case calligraphy
+    case marker
+    case pencil
+    case airbrush
+    case chalk
+}
+
+public enum GlossTaper: String, Codable, Sendable {
+    case `in`
+    case out
+    case both
+    case none
+}
+
 // MARK: - Path operations (SVG-style)
 
 /// One segment of a path. Tagged-union encoded as
@@ -683,6 +774,10 @@ public struct PathPayload: Codable, Sendable {
     /// If true, ensures the path is closed before stroking/filling even if it
     /// doesn't end with Z.
     public var closed: Bool?
+    public var brush: GlossBrushKind?       // stroke brush; fill ignores brush
+    public var brushAngle: Double?          // radians, calligraphy nib angle
+    public var pressures: [Double]?         // 0…1, mapped onto flattened path arclength
+    public var taper: GlossTaper?           // default .none
 
     public init(author: String? = nil, idempotencyKey: String? = nil, layerID: String? = nil,
                 ops: [PathOp],
@@ -691,7 +786,9 @@ public struct PathPayload: Codable, Sendable {
                 opacity: Double = 1, blend: GlossBlend = .normal,
                 lineCap: GlossLineCap? = nil, lineJoin: GlossLineJoin? = nil,
                 miterLimit: Double? = nil, dash: [Double]? = nil,
-                closed: Bool? = nil) {
+                closed: Bool? = nil,
+                brush: GlossBrushKind? = nil, brushAngle: Double? = nil,
+                pressures: [Double]? = nil, taper: GlossTaper? = nil) {
         self.author = author
         self.idempotencyKey = idempotencyKey
         self.layerID = layerID
@@ -706,10 +803,15 @@ public struct PathPayload: Codable, Sendable {
         self.miterLimit = miterLimit
         self.dash = dash
         self.closed = closed
+        self.brush = brush
+        self.brushAngle = brushAngle
+        self.pressures = pressures
+        self.taper = taper
     }
 
     private enum CodingKeys: String, CodingKey {
         case author, idempotencyKey, layerID, ops, color, strokeWidth, fill, opacity, blend, lineCap, lineJoin, miterLimit, dash, closed
+        case brush, brushAngle, pressures, taper
     }
 
     public init(from decoder: Decoder) throws {
@@ -728,6 +830,14 @@ public struct PathPayload: Codable, Sendable {
         self.miterLimit = try c.decodeIfPresent(Double.self, forKey: .miterLimit)
         self.dash = try c.decodeIfPresent([Double].self, forKey: .dash)
         self.closed = try c.decodeIfPresent(Bool.self, forKey: .closed)
+        self.brush = try c.decodeIfPresent(GlossBrushKind.self, forKey: .brush)
+        self.brushAngle = try c.decodeIfPresent(Double.self, forKey: .brushAngle)
+        if let raw = try c.decodeIfPresent([Double].self, forKey: .pressures) {
+            self.pressures = raw.map { max(0, min(1, $0)) }
+        } else {
+            self.pressures = nil
+        }
+        self.taper = try c.decodeIfPresent(GlossTaper.self, forKey: .taper)
     }
 }
 
@@ -810,4 +920,228 @@ public struct PixelsPayload: Codable, Sendable {
         self.defaultColor = try c.decodeIfPresent(GlossColor.self, forKey: .defaultColor)
         self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
     }
+}
+
+// MARK: - Layers
+
+public struct GlossLayer: Codable, Sendable, Equatable {
+    public var id: String
+    public var name: String
+    public var author: String?
+    public var visible: Bool
+    public var opacity: Double
+    public var blend: GlossBlend
+    public var locked: Bool
+    public var createdAt: Date
+
+    public init(id: String, name: String, author: String? = nil,
+                visible: Bool = true, opacity: Double = 1, blend: GlossBlend = .normal,
+                locked: Bool = false, createdAt: Date = Date()) {
+        self.id = id
+        self.name = name
+        self.author = author
+        self.visible = visible
+        self.opacity = max(0, min(1, opacity))
+        self.blend = blend
+        self.locked = locked
+        self.createdAt = createdAt
+    }
+}
+
+public struct LayerStackState: Codable, Sendable {
+    public var layers: [GlossLayer]      // bottom → top
+    public var activeLayerID: String
+    public var memoryUsageBytes: Int
+    public var memoryCapBytes: Int
+    public var maxLayers: Int
+
+    public init(layers: [GlossLayer], activeLayerID: String,
+                memoryUsageBytes: Int, memoryCapBytes: Int, maxLayers: Int) {
+        self.layers = layers
+        self.activeLayerID = activeLayerID
+        self.memoryUsageBytes = memoryUsageBytes
+        self.memoryCapBytes = memoryCapBytes
+        self.maxLayers = maxLayers
+    }
+}
+
+public struct LayerCreatePayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    /// Optional explicit ID. Used by Claude/Codex/Brenden to reserve named layers
+    /// like "claude-layer". If nil, a UUID-based id is generated.
+    public var id: String?
+    public var name: String?
+    /// If set, place new layer immediately above this layer ID. Nil → top of stack.
+    public var afterID: String?
+    public var visible: Bool?
+    public var opacity: Double?
+    public var blend: GlossBlend?
+    public var locked: Bool?
+    /// If true, also set this new layer as the active draw target.
+    public var setActive: Bool?
+
+    public init(author: String? = nil, idempotencyKey: String? = nil,
+                id: String? = nil, name: String? = nil, afterID: String? = nil,
+                visible: Bool? = nil, opacity: Double? = nil, blend: GlossBlend? = nil,
+                locked: Bool? = nil, setActive: Bool? = nil) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+        self.name = name
+        self.afterID = afterID
+        self.visible = visible
+        self.opacity = opacity
+        self.blend = blend
+        self.locked = locked
+        self.setActive = setActive
+    }
+}
+
+public struct LayerDeletePayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var id: String
+
+    public init(author: String? = nil, idempotencyKey: String? = nil, id: String) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+    }
+}
+
+public struct LayerReorderPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var id: String
+    /// Target index in the layer stack (0 = bottom, count-1 = top).
+    public var toIndex: Int
+
+    public init(author: String? = nil, idempotencyKey: String? = nil,
+                id: String, toIndex: Int) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+        self.toIndex = toIndex
+    }
+}
+
+public struct LayerVisibilityPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var id: String
+    public var visible: Bool
+
+    public init(author: String? = nil, idempotencyKey: String? = nil,
+                id: String, visible: Bool) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+        self.visible = visible
+    }
+}
+
+public struct LayerOpacityPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var id: String
+    public var opacity: Double
+
+    public init(author: String? = nil, idempotencyKey: String? = nil,
+                id: String, opacity: Double) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+        self.opacity = max(0, min(1, opacity))
+    }
+}
+
+public struct LayerBlendPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var id: String
+    public var blend: GlossBlend
+
+    public init(author: String? = nil, idempotencyKey: String? = nil,
+                id: String, blend: GlossBlend) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+        self.blend = blend
+    }
+}
+
+public struct LayerLockPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var id: String
+    public var locked: Bool
+
+    public init(author: String? = nil, idempotencyKey: String? = nil,
+                id: String, locked: Bool) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+        self.locked = locked
+    }
+}
+
+public struct LayerActivatePayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var id: String
+
+    public init(author: String? = nil, idempotencyKey: String? = nil, id: String) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.id = id
+    }
+}
+
+public struct CanvasNewPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var width: Int
+    public var height: Int
+    public var background: GlossColor?
+    /// If true, keep the existing layer stack (just resize each layer's bitmap).
+    /// If false, reset to a single fresh background layer.
+    public var preserveLayers: Bool
+
+    public init(author: String? = nil, idempotencyKey: String? = nil,
+                width: Int, height: Int, background: GlossColor? = nil,
+                preserveLayers: Bool = false) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.width = max(16, min(8192, width))
+        self.height = max(16, min(8192, height))
+        self.background = background
+        self.preserveLayers = preserveLayers
+    }
+}
+
+// MARK: - Canvas presets
+
+public struct CanvasPreset: Codable, Sendable, Equatable {
+    public let name: String
+    public let width: Int
+    public let height: Int
+
+    public init(name: String, width: Int, height: Int) {
+        self.name = name
+        self.width = width
+        self.height = height
+    }
+}
+
+public enum GlossCanvasPresets {
+    public static let all: [CanvasPreset] = [
+        CanvasPreset(name: "1024_square",        width: 1024, height: 1024),
+        CanvasPreset(name: "2048_square",        width: 2048, height: 2048),
+        CanvasPreset(name: "4096_square",        width: 4096, height: 4096),
+        CanvasPreset(name: "1080x1920_portrait", width: 1080, height: 1920),
+        CanvasPreset(name: "1920x1080_landscape", width: 1920, height: 1080),
+        CanvasPreset(name: "800x600_classic",    width: 800,  height: 600),
+        CanvasPreset(name: "512_square",         width: 512,  height: 512)
+    ]
 }

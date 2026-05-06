@@ -82,6 +82,25 @@ Valid blend modes:
 normal, multiply, screen, overlay, darken, lighten, plusLighter, plusDarker, clear
 ```
 
+### Layers
+
+Draw commands can include `layerID`. If omitted, Gloss draws on the active layer. Explicit missing layer IDs are rejected with `404 layer_not_found`, except `claude-layer`, `codex-layer`, and `brenden-layer`, which auto-create on first draw.
+
+Layer order is bottom to top. Index `0` is the bottom layer.
+
+### Brushes
+
+`/stroke` and `/path` support:
+
+```text
+brush: round | calligraphy | marker | pencil | airbrush | chalk
+brushAngle: radians, used by calligraphy
+pressures: 0...1 values for variable width
+taper: in | out | both | none
+```
+
+For `/stroke`, `pressures` must match `points.count`. For `/path`, pressures are mapped over the flattened path by arclength.
+
 ### Command Result
 
 Mutation endpoints return:
@@ -110,9 +129,39 @@ Errors return:
 
 ## API Reference
 
+### Route Index
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET | `/state` | Canvas state, recent commands, cursors, layer state |
+| GET | `/layers`, `/layer/list` | Layer stack only |
+| GET | `/canvas/presets` | Named canvas size presets |
+| GET | `/canvas.png`, `/canvas` | Composite PNG, optional `max_dim` |
+| GET | `/export` | Downloadable composite PNG |
+| GET | `/region.png`, `/canvas/region.png`, `/region` | Cropped composite PNG |
+| GET | `/sample`, `/eyedropper` | One composite pixel |
+| GET | `/sample/grid` | Region sampled into a 2D RGBA array |
+| GET | `/sample/path` | Ordered point samples |
+| GET | `/canvas.ascii` | Text-grid canvas perception |
+| GET | `/diff` | Reserved; returns `501 not_implemented` |
+| POST | `/stroke` | Smoothed stroke with brushes, pressure, taper |
+| POST | `/path` | SVG-like path with brushes, pressure, taper |
+| POST | `/pixel`, `/pixels` | Exact pixel art writes |
+| POST | `/shape`, `/text`, `/image`, `/image_paste` | Basic drawing primitives |
+| POST | `/clear`, `/undo`, `/redo` | History and canvas clearing |
+| POST | `/resize`, `/canvas/new` | Canvas size and reset operations |
+| POST | `/layer/create` | Create a layer; response includes `layer` |
+| POST | `/layer/delete` | Delete a layer |
+| POST | `/layer/reorder` | Move a layer; `toIndex=0` means bottom |
+| POST | `/layer/visibility`, `/layer/show`, `/layer/hide` | Toggle visibility |
+| POST | `/layer/opacity` | Set layer opacity |
+| POST | `/layer/blend` | Set layer blend mode |
+| POST | `/layer/lock` | Lock or unlock drawing on a layer |
+| POST | `/layer/activate`, `/layer/active` | Set active draw target |
+
 ### GET /state
 
-Returns canvas size, revision, recent commands, and author cursors.
+Returns canvas size, revision, recent commands, author cursors, and layer stack state.
 
 ```bash
 curl -s http://127.0.0.1:7778/state | python3 -m json.tool
@@ -127,8 +176,46 @@ Response:
   "height": 1024,
   "revision": 0,
   "lastCommands": [],
-  "authorCursors": {}
+  "authorCursors": {},
+  "layerState": {
+    "layers": [
+      {"id": "base", "name": "Base", "visible": true, "opacity": 1, "blend": "normal", "locked": false}
+    ],
+    "activeLayerID": "base",
+    "memoryUsageBytes": 4194304,
+    "memoryCapBytes": 67108864,
+    "maxLayers": 16
+  }
 }
+```
+
+### GET /layers
+
+Returns only the layer stack state plus the current revision.
+
+```bash
+curl -s http://127.0.0.1:7778/layers | python3 -m json.tool
+```
+
+Alias:
+
+```bash
+curl -s http://127.0.0.1:7778/layer/list | python3 -m json.tool
+```
+
+### GET /canvas/presets
+
+Lists named canvas size presets.
+
+```bash
+curl -s http://127.0.0.1:7778/canvas/presets | python3 -m json.tool
+```
+
+Current presets:
+
+```text
+1024_square, 2048_square, 4096_square, 1080x1920_portrait,
+1920x1080_landscape, 800x600_classic, 512_square
 ```
 
 ### GET /canvas.png
@@ -282,11 +369,13 @@ Response:
 
 ### GET /diff
 
-Reserved for revision-aware sparse diffs. v1.1 returns `501 not_implemented` because `CanvasStore` does not retain per-revision snapshots yet.
+Reserved for revision-aware sparse diffs. Gloss currently returns `501 not_implemented` because `CanvasStore` does not retain per-revision dirty-cell history yet.
 
 ## Mutation Endpoints
 
 All mutation endpoints accept a JSON object. The route infers `type`, so `POST /stroke` can omit `"type":"stroke"`. You can still include `type` explicitly when using a generic command payload.
+
+All drawing endpoints accept optional `layerID`. Missing means active layer.
 
 ### POST /stroke
 
@@ -298,12 +387,17 @@ Payload:
 {
   "author": "codex",
   "idempotencyKey": "codex-stroke-001",
+  "layerID": "codex-layer",
   "points": [{"x": 120, "y": 140}, {"x": 220, "y": 210}, {"x": 340, "y": 150}],
   "width": 18,
   "color": "#14E6D4",
   "opacity": 1,
   "blend": "normal",
-  "simplify": 0.5
+  "simplify": 0.5,
+  "brush": "marker",
+  "brushAngle": 0,
+  "pressures": [0.25, 1, 0.35],
+  "taper": "both"
 }
 ```
 
@@ -318,7 +412,7 @@ curl -s -X POST http://127.0.0.1:7778/stroke \
 
 Required: `points`, `width`, `color`.
 
-Defaults: `opacity=1`, `blend=normal`.
+Defaults: `opacity=1`, `blend=normal`, `brush=round`, `taper=none`.
 
 ### POST /shape
 
@@ -441,7 +535,7 @@ Defaults: native image size if `w` and `h` are omitted; `opacity=1`, `blend=norm
 
 ### POST /path
 
-Draws an SVG-like path with explicit line cap/join, optional fill, dash, and cubic/quadratic segments.
+Draws an SVG-like path with explicit line cap/join, optional fill, dash, brush, pressure, and cubic/quadratic segments.
 
 ```bash
 curl -s -X POST http://127.0.0.1:7778/path \
@@ -471,6 +565,10 @@ lineJoin: round | miter | bevel
 miterLimit: optional numeric miter limit
 dash: optional dash lengths array
 closed: true to close before drawing
+brush: round | calligraphy | marker | pencil | airbrush | chalk
+brushAngle: radians, used by calligraphy
+pressures: optional pressure values mapped over flattened arclength
+taper: in | out | both | none
 ```
 
 ### POST /pixel
@@ -552,6 +650,78 @@ Payload:
 ```
 
 `preserveContents=false` clears to white after resizing.
+
+### POST /canvas/new
+
+Starts a fresh canvas. Unlike `/resize`, this can either reset to one base layer or preserve the layer stack while resizing every layer bitmap.
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/canvas/new \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","width":2048,"height":2048,"background":"#FFFFFF","preserveLayers":false}' \
+  | python3 -m json.tool
+```
+
+Payload:
+
+```json
+{
+  "author": "codex",
+  "idempotencyKey": "codex-new-001",
+  "width": 2048,
+  "height": 2048,
+  "background": "#FFFFFF",
+  "preserveLayers": false
+}
+```
+
+### Layer Mutations
+
+Create a layer:
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/layer/create \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","id":"codex-layer","name":"Codex","setActive":true}' \
+  | python3 -m json.tool
+```
+
+`/layer/create` accepts:
+
+```text
+id: optional explicit layer ID
+name: optional display name
+afterID: optional layer ID to insert above
+visible: optional bool, default true
+opacity: optional 0...1, default 1
+blend: optional blend mode, default normal
+locked: optional bool, default false
+setActive: optional bool
+```
+
+The response includes both the created `layer` and `layerState`.
+
+Other layer endpoints:
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/layer/activate   -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer"}'
+curl -s -X POST http://127.0.0.1:7778/layer/visibility -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer","visible":false}'
+curl -s -X POST http://127.0.0.1:7778/layer/show       -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer"}'
+curl -s -X POST http://127.0.0.1:7778/layer/hide       -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer"}'
+curl -s -X POST http://127.0.0.1:7778/layer/opacity    -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer","opacity":0.75}'
+curl -s -X POST http://127.0.0.1:7778/layer/blend      -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer","blend":"multiply"}'
+curl -s -X POST http://127.0.0.1:7778/layer/lock       -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer","locked":true}'
+curl -s -X POST http://127.0.0.1:7778/layer/reorder    -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer","toIndex":0}'
+curl -s -X POST http://127.0.0.1:7778/layer/delete     -H 'Content-Type: application/json' -d '{"author":"codex","id":"codex-layer"}'
+```
+
+Layer draw failures map to useful HTTP errors:
+
+```text
+layer_locked -> 400
+layer_cap -> 400
+layer_not_found -> 404
+```
 
 ## Dogfood Draw Pattern
 

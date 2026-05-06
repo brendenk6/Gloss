@@ -85,6 +85,21 @@ public final class CanvasStore {
         return ctx
     }
 
+    private static func validDirtyRect(_ rect: CGRect?) -> CGRect? {
+        guard let rect else { return nil }
+        let standardized = rect.standardized
+        guard !standardized.isNull, !standardized.isInfinite, !standardized.isEmpty else {
+            return nil
+        }
+        guard standardized.origin.x.isFinite,
+              standardized.origin.y.isFinite,
+              standardized.size.width.isFinite,
+              standardized.size.height.isFinite else {
+            return nil
+        }
+        return standardized
+    }
+
     private func fillBackground(_ color: GlossColor) {
         context.saveGState()
         context.setFillColor(color.cgColor)
@@ -163,7 +178,7 @@ public final class CanvasStore {
             redoStack.removeAll()
         }
 
-        return CommandResult(revision: revision, dirtyRect: dirty.map(GlossRect.init), deduped: false)
+        return CommandResult(revision: revision, dirtyRect: Self.validDirtyRect(dirty).map(GlossRect.init), deduped: false)
     }
 
     /// Snapshot the whole canvas, optionally downscaled to fit within maxDim

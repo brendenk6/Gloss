@@ -41,6 +41,7 @@ struct ContentView: View {
                     ZStack {
                         CanvasView(store: store)
                             .aspectRatio(CGFloat(store.width) / CGFloat(store.height), contentMode: .fit)
+                            .overlay(GridOverlay(store: store))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                                     .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)

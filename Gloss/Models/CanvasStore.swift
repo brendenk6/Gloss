@@ -346,19 +346,18 @@ public final class CanvasStore {
             .foregroundColor: NSColor(cgColor: p.color.cgColor) ?? .black
         ]
         let attr = NSAttributedString(string: p.string, attributes: attrs)
-        let line = CTLineCreateWithAttributedString(attr)
-        let bbox = CTLineGetImageBounds(line, context)
+        let size = attr.size()
 
         context.saveGState()
         defer { context.restoreGState() }
         context.setBlendMode(p.blend.cgBlend)
         context.setAlpha(p.opacity)
-        // Our CTM is y-flipped; flip back so the glyphs render upright.
-        context.textMatrix = .identity
-        context.translateBy(x: p.x, y: p.y + p.fontSize)
-        context.scaleBy(x: 1, y: -1)
-        CTLineDraw(line, context)
-        return CGRect(x: p.x + bbox.minX, y: p.y, width: bbox.width, height: p.fontSize * 1.4)
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        attr.draw(at: CGPoint(x: p.x, y: p.y))
+        return CGRect(x: p.x, y: p.y, width: size.width, height: size.height)
     }
 
     private func drawImage(_ p: ImagePayload) -> CGRect {

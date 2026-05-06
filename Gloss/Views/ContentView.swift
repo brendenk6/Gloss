@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var sampleColor: RGBA? = nil
     @State private var screenHover: CGPoint? = nil
     @State private var gridPopoverShown: Bool = false
+    @State private var presetPopoverShown: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -124,6 +125,14 @@ struct ContentView: View {
                 }
                 .popover(isPresented: $gridPopoverShown, arrowEdge: .bottom) {
                     GridControls(store: store)
+                }
+                glassChromeButton(icon: "rectangle.on.rectangle", tooltip: "New canvas (preset)") {
+                    presetPopoverShown.toggle()
+                }
+                .popover(isPresented: $presetPopoverShown, arrowEdge: .bottom) {
+                    PresetPicker(store: store) {
+                        presetPopoverShown = false
+                    }
                 }
             }
 

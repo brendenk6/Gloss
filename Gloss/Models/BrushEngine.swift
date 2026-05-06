@@ -18,7 +18,8 @@ import CoreGraphics
 public enum BrushEngine {
 
     public static let defaultStampedBrushes: Set<GlossBrushKind> = [
-        .calligraphy, .marker, .pencil, .airbrush, .chalk
+        .calligraphy, .marker, .pencil, .airbrush, .chalk,
+        .ink, .ribbon, .glaze
     ]
 
     public struct StrokeRequest {
@@ -98,6 +99,7 @@ public enum BrushEngine {
 
         let spacing = self.spacing(for: r.brush, baseWidth: r.baseWidth)
         let taperLen = min(totalLen * 0.5, max(r.baseWidth * 2, totalLen * 0.15))
+
         var rng = LCG(seed: r.seed)
         var bbox: CGRect = .null
 
@@ -187,6 +189,17 @@ public enum BrushEngine {
         case .chalk:
             return stampChalk(ctx: ctx, x: x, y: y, width: width,
                               color: color, opacity: opacity, rng: &rng)
+        case .ink:
+            return stampInk(ctx: ctx, x: x, y: y, width: width,
+                            color: color, opacity: opacity, rng: &rng)
+        case .ribbon:
+            return stampRibbon(ctx: ctx, x: x, y: y, width: width,
+                               direction: direction, brushAngle: brushAngle,
+                               color: color, opacity: opacity, rng: &rng)
+        case .glaze:
+            return stampGlaze(ctx: ctx, x: x, y: y, width: width,
+                              direction: direction, color: color,
+                              opacity: opacity)
         }
     }
 
@@ -315,6 +328,108 @@ public enum BrushEngine {
         return CGRect(x: x - radius, y: y - radius, width: 2 * radius, height: 2 * radius)
     }
 
+    private static func stampInk(ctx: CGContext, x: Double, y: Double,
+                                 width: Double, color: GlossColor,
+                                 opacity: Double, rng: inout LCG) -> CGRect {
+        // Wet pressure ink: dense core, tiny soft shoulder, and sub-pixel
+        // wobble so pressure-tapered curves do not look mechanically perfect.
+        let r = width / 2
+        let wobble = min(0.65, width * 0.025)
+        let px = x + rng.nextDouble(in: -wobble..<wobble)
+        let py = y + rng.nextDouble(in: -wobble..<wobble)
+        let alpha = max(0, min(1, color.a * opacity))
+        let shoulderAlpha = max(0, min(1, alpha * 0.18))
+
+        ctx.setFillColor(CGColor(srgbRed: color.r, green: color.g, blue: color.b,
+                                 alpha: CGFloat(shoulderAlpha)))
+        let shoulder = r * 1.16
+        ctx.fillEllipse(in: CGRect(x: px - shoulder, y: py - shoulder,
+                                   width: shoulder * 2, height: shoulder * 2))
+
+        ctx.setFillColor(CGColor(srgbRed: color.r, green: color.g, blue: color.b,
+                                 alpha: CGFloat(alpha)))
+        ctx.fillEllipse(in: CGRect(x: px - r, y: py - r, width: r * 2, height: r * 2))
+
+        return CGRect(x: px - shoulder, y: py - shoulder,
+                      width: shoulder * 2, height: shoulder * 2)
+    }
+
+    private static func stampRibbon(ctx: CGContext, x: Double, y: Double,
+                                    width: Double, direction: Double,
+                                    brushAngle: Double,
+                                    color: GlossColor,
+                                    opacity: Double,
+                                    rng: inout LCG) -> CGRect {
+        // A pressure ribbon like a flat flexible nib. With brushAngle at zero,
+        // the nib follows the curve normal; non-zero brushAngle locks the nib
+        // to a caller-chosen angle for more traditional calligraphy.
+        let followAngle = abs(brushAngle) < 1e-9 ? direction + (.pi / 2) : brushAngle
+        let major = max(0.5, width)
+        let minor = max(0.45, width * 0.34)
+        let alpha = max(0, min(1, color.a * opacity))
+        let jitter = min(0.4, width * 0.01)
+        let px = x + rng.nextDouble(in: -jitter..<jitter)
+        let py = y + rng.nextDouble(in: -jitter..<jitter)
+
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.translateBy(x: CGFloat(px), y: CGFloat(py))
+        ctx.rotate(by: CGFloat(followAngle))
+
+        let outerAlpha = max(0, min(1, alpha * 0.16))
+        ctx.setFillColor(CGColor(srgbRed: color.r, green: color.g, blue: color.b,
+                                 alpha: CGFloat(outerAlpha)))
+        ctx.fillEllipse(in: CGRect(x: -major * 0.55, y: -minor * 0.85,
+                                   width: major * 1.1, height: minor * 1.7))
+
+        ctx.setFillColor(CGColor(srgbRed: color.r, green: color.g, blue: color.b,
+                                 alpha: CGFloat(alpha)))
+        ctx.fillEllipse(in: CGRect(x: -major / 2, y: -minor / 2,
+                                   width: major, height: minor))
+
+        let radius = max(major * 0.55, minor)
+        return CGRect(x: px - radius, y: py - radius,
+                      width: radius * 2, height: radius * 2)
+    }
+
+    private static func stampGlaze(ctx: CGContext, x: Double, y: Double,
+                                   width: Double, direction: Double,
+                                   color: GlossColor,
+                                   opacity: Double) -> CGRect {
+        // Transparent marker / glaze. Repeated passes build a saturated center
+        // while the edges stay feathered, matching broad soft strokes.
+        let alpha = max(0, min(1, color.a * opacity))
+        let angle = direction
+        let major = max(1.0, width * 0.74)
+        let minor = max(1.0, width * 0.50)
+
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.translateBy(x: CGFloat(x), y: CGFloat(y))
+        ctx.rotate(by: CGFloat(angle))
+
+        let rings: [(scale: Double, alpha: Double)] = [
+            (1.35, 0.014),
+            (1.02, 0.024),
+            (0.72, 0.038),
+            (0.46, 0.052)
+        ]
+        for ring in rings {
+            ctx.setFillColor(CGColor(srgbRed: color.r, green: color.g, blue: color.b,
+                                     alpha: CGFloat(max(0, min(1, alpha * ring.alpha)))))
+            ctx.fillEllipse(in: CGRect(
+                x: -major * ring.scale,
+                y: -minor * ring.scale,
+                width: major * ring.scale * 2,
+                height: minor * ring.scale * 2
+            ))
+        }
+
+        let radius = max(major, minor) * 1.25
+        return CGRect(x: x - radius, y: y - radius,
+                      width: radius * 2, height: radius * 2)
+    }
+
     // MARK: - Spacing / pressure / taper
 
     private static func spacing(for brush: GlossBrushKind, baseWidth: Double) -> Double {
@@ -325,6 +440,9 @@ public enum BrushEngine {
         case .pencil:       return max(1.0, baseWidth * 0.40)
         case .airbrush:     return max(2.0, baseWidth * 0.50)
         case .chalk:        return max(1.0, baseWidth * 0.32)
+        case .ink:          return max(0.5, baseWidth * 0.12)
+        case .ribbon:       return max(0.35, baseWidth * 0.012)
+        case .glaze:        return max(0.75, baseWidth * 0.060)
         }
     }
 

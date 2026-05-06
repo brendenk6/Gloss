@@ -144,6 +144,8 @@ public enum DrawCommand: Codable, Sendable {
     case layerBlend(LayerBlendPayload)
     case layerLock(LayerLockPayload)
     case layerActivate(LayerActivatePayload)
+    case gridConfig(GridConfigPayload)
+    case gridFill(GridFillPayload)
 
     // MARK: Common metadata
 
@@ -169,6 +171,8 @@ public enum DrawCommand: Codable, Sendable {
         case .layerBlend(let p): return p.author
         case .layerLock(let p): return p.author
         case .layerActivate(let p): return p.author
+        case .gridConfig(let p): return p.author
+        case .gridFill(let p): return p.author
         }
     }
 
@@ -194,6 +198,8 @@ public enum DrawCommand: Codable, Sendable {
         case .layerBlend(let p): return p.idempotencyKey
         case .layerLock(let p): return p.idempotencyKey
         case .layerActivate(let p): return p.idempotencyKey
+        case .gridConfig(let p): return p.idempotencyKey
+        case .gridFill(let p): return p.idempotencyKey
         }
     }
 
@@ -220,6 +226,8 @@ public enum DrawCommand: Codable, Sendable {
         case .layerBlend: return "layerBlend"
         case .layerLock: return "layerLock"
         case .layerActivate: return "layerActivate"
+        case .gridConfig: return "gridConfig"
+        case .gridFill: return "gridFill"
         }
     }
 
@@ -252,6 +260,8 @@ public enum DrawCommand: Codable, Sendable {
         case "layerBlend":     self = .layerBlend(try single.decode(LayerBlendPayload.self))
         case "layerLock":      self = .layerLock(try single.decode(LayerLockPayload.self))
         case "layerActivate":  self = .layerActivate(try single.decode(LayerActivatePayload.self))
+        case "gridConfig":     self = .gridConfig(try single.decode(GridConfigPayload.self))
+        case "gridFill":       self = .gridFill(try single.decode(GridFillPayload.self))
         default:
             throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown command type \(type)"))
         }
@@ -280,6 +290,8 @@ public enum DrawCommand: Codable, Sendable {
         case .layerBlend(let p):      try single.encode(_TaggedEncode(type: "layerBlend", payload: p))
         case .layerLock(let p):       try single.encode(_TaggedEncode(type: "layerLock", payload: p))
         case .layerActivate(let p):   try single.encode(_TaggedEncode(type: "layerActivate", payload: p))
+        case .gridConfig(let p):      try single.encode(_TaggedEncode(type: "gridConfig", payload: p))
+        case .gridFill(let p):        try single.encode(_TaggedEncode(type: "gridFill", payload: p))
         }
     }
 }
@@ -591,11 +603,14 @@ public struct CanvasState: Codable, Sendable {
     public var width: Int
     public var height: Int
     public var revision: Int
+    public var grid: GridSpec
     public var lastCommands: [LastCommandSummary]
     public var authorCursors: [String: GlossPoint]   // author → last-known cursor
     public init(width: Int, height: Int, revision: Int,
+                grid: GridSpec,
                 lastCommands: [LastCommandSummary], authorCursors: [String: GlossPoint]) {
         self.width = width; self.height = height; self.revision = revision
+        self.grid = grid
         self.lastCommands = lastCommands; self.authorCursors = authorCursors
     }
 }
@@ -673,6 +688,9 @@ public enum GlossBrushKind: String, Codable, Sendable {
     case pencil
     case airbrush
     case chalk
+    case ink
+    case ribbon
+    case glaze
 }
 
 public enum GlossTaper: String, Codable, Sendable {
@@ -1101,21 +1119,27 @@ public struct LayerActivatePayload: Codable, Sendable {
 public struct CanvasNewPayload: Codable, Sendable {
     public var author: String?
     public var idempotencyKey: String?
+    public var preset: String?
     public var width: Int
     public var height: Int
     public var background: GlossColor?
+    public var grid: GridSpec?
     /// If true, keep the existing layer stack (just resize each layer's bitmap).
     /// If false, reset to a single fresh background layer.
     public var preserveLayers: Bool
 
     public init(author: String? = nil, idempotencyKey: String? = nil,
+                preset: String? = nil,
                 width: Int, height: Int, background: GlossColor? = nil,
+                grid: GridSpec? = nil,
                 preserveLayers: Bool = false) {
         self.author = author
         self.idempotencyKey = idempotencyKey
+        self.preset = preset
         self.width = max(16, min(8192, width))
         self.height = max(16, min(8192, height))
         self.background = background
+        self.grid = grid
         self.preserveLayers = preserveLayers
     }
 }
@@ -1126,22 +1150,66 @@ public struct CanvasPreset: Codable, Sendable, Equatable {
     public let name: String
     public let width: Int
     public let height: Int
+    public let description: String
+    public let grid: GridSpec
 
-    public init(name: String, width: Int, height: Int) {
+    public init(name: String, width: Int, height: Int, description: String) {
         self.name = name
         self.width = width
         self.height = height
+        self.description = description
+        self.grid = GridSpec(
+            cellW: CanvasPreset.defaultCellSize(forLongAxis: max(width, height)),
+            cellH: CanvasPreset.defaultCellSize(forLongAxis: max(width, height))
+        )
+    }
+
+    private static func defaultCellSize(forLongAxis longAxis: Int) -> Int {
+        switch longAxis {
+        case ..<1600: return 12
+        case ..<3000: return 16
+        case ..<3600: return 20
+        default: return 24
+        }
     }
 }
 
 public enum GlossCanvasPresets {
-    public static let all: [CanvasPreset] = [
-        CanvasPreset(name: "1024_square",        width: 1024, height: 1024),
-        CanvasPreset(name: "2048_square",        width: 2048, height: 2048),
-        CanvasPreset(name: "4096_square",        width: 4096, height: 4096),
-        CanvasPreset(name: "1080x1920_portrait", width: 1080, height: 1920),
-        CanvasPreset(name: "1920x1080_landscape", width: 1920, height: 1080),
-        CanvasPreset(name: "800x600_classic",    width: 800,  height: 600),
-        CanvasPreset(name: "512_square",         width: 512,  height: 512)
+    private static let landscape: [CanvasPreset] = [
+        CanvasPreset(name: "tv_hd", width: 1280, height: 720, description: "HD broadcast"),
+        CanvasPreset(name: "tv_fhd", width: 1920, height: 1080, description: "Modern anime / streaming standard"),
+        CanvasPreset(name: "tv_uhd", width: 3840, height: 2160, description: "4K UHD broadcast"),
+        CanvasPreset(name: "tv_dci", width: 4096, height: 2160, description: "DCI 4K theatrical"),
+        CanvasPreset(name: "tv_ntsc", width: 720, height: 486, description: "Classic NTSC retro"),
+        CanvasPreset(name: "iphone_se", width: 1334, height: 750, description: "iPhone SE landscape"),
+        CanvasPreset(name: "iphone_16", width: 2556, height: 1179, description: "iPhone 16 landscape"),
+        CanvasPreset(name: "iphone_16_plus", width: 2796, height: 1290, description: "iPhone 16 Plus landscape"),
+        CanvasPreset(name: "iphone_16_pro", width: 2622, height: 1206, description: "iPhone 16 Pro landscape"),
+        CanvasPreset(name: "iphone_16_pro_max", width: 2868, height: 1320, description: "iPhone 16 Pro Max landscape"),
+        CanvasPreset(name: "ipad_mini", width: 2266, height: 1488, description: "iPad mini landscape"),
+        CanvasPreset(name: "ipad_pro_11", width: 2420, height: 1668, description: "iPad Pro 11-inch / Air 11-inch landscape"),
+        CanvasPreset(name: "ipad_air_13", width: 2732, height: 2048, description: "iPad Air 13-inch landscape"),
+        CanvasPreset(name: "ipad_pro_13", width: 2752, height: 2064, description: "iPad Pro 13-inch landscape"),
+        CanvasPreset(name: "square_1k", width: 1024, height: 1024, description: "Social square"),
+        CanvasPreset(name: "square_2k", width: 2048, height: 2048, description: "High-res social square"),
+        CanvasPreset(name: "study_default", width: 1600, height: 1164, description: "Default Gloss study canvas")
     ]
+
+    public static let all: [CanvasPreset] = {
+        let portraits = landscape
+            .filter { $0.width != $0.height }
+            .map {
+                CanvasPreset(
+                    name: "\($0.name)_portrait",
+                    width: $0.height,
+                    height: $0.width,
+                    description: "\($0.description) portrait"
+                )
+            }
+        return landscape + portraits
+    }()
+
+    public static func resolve(_ name: String) -> CanvasPreset? {
+        all.first { $0.name == name }
+    }
 }

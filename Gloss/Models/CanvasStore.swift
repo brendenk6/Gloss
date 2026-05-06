@@ -3,6 +3,12 @@ import CoreGraphics
 import AppKit
 import Observation
 
+private struct CanvasHistorySnapshot {
+    var stack: LayerStackSnapshot
+    var grid: GridSpec
+    var gridCellsByLayer: [String: [GridCellIndex: GlossColor]]
+}
+
 /// The single source of truth for the Gloss canvas.
 ///
 /// As of v1.2, CanvasStore owns a `LayerStack` (one CGContext per layer, all
@@ -26,6 +32,8 @@ public final class CanvasStore {
     public private(set) var stack: LayerStack
     public var width: Int { stack.width }
     public var height: Int { stack.height }
+    public private(set) var grid: GridSpec
+    private var gridCellsByLayer: [String: [GridCellIndex: GlossColor]] = [:]
 
     public private(set) var revision: Int = 0
     public private(set) var lastCommands: [LastCommandSummary] = []
@@ -35,8 +43,8 @@ public final class CanvasStore {
     private var idempotencyKeyOrder: [String] = []
     private let idempotencyCacheCap = 256
 
-    private var undoStack: [(snapshot: LayerStackSnapshot, summary: LastCommandSummary)] = []
-    private var redoStack: [(snapshot: LayerStackSnapshot, summary: LastCommandSummary)] = []
+    private var undoStack: [(snapshot: CanvasHistorySnapshot, summary: LastCommandSummary)] = []
+    private var redoStack: [(snapshot: CanvasHistorySnapshot, summary: LastCommandSummary)] = []
     private let undoCap = 32
 
     /// Cached composite for SwiftUI binding. Refreshed on revision change.
@@ -47,6 +55,7 @@ public final class CanvasStore {
     public init(width: Int = 1024, height: Int = 1024,
                 background: GlossColor = GlossColor(r: 1, g: 1, b: 1)) {
         self.stack = LayerStack(width: width, height: height, background: background)
+        self.grid = GridSpec().normalized(canvasWidth: width, canvasHeight: height)
     }
 
     private static func validDirtyRect(_ rect: CGRect?) -> CGRect? {
@@ -76,15 +85,16 @@ public final class CanvasStore {
         let mutatesPixelsOrStack: Bool = {
             switch command {
             case .stroke, .shape, .text, .image, .path, .pixel, .pixels, .clear, .resize, .canvasNew,
-                 .layerCreate, .layerDelete, .layerReorder, .layerVisibility, .layerOpacity, .layerBlend:
+                 .layerCreate, .layerDelete, .layerReorder, .layerVisibility, .layerOpacity, .layerBlend,
+                 .gridConfig, .gridFill:
                 return true
             case .layerLock, .layerActivate, .undo, .redo:
                 return false
             }
         }()
 
-        let snapshotForUndo: LayerStackSnapshot? = (mutatesPixelsOrStack && !isHistoryOp)
-            ? stack.snapshot()
+        let snapshotForUndo: CanvasHistorySnapshot? = (mutatesPixelsOrStack && !isHistoryOp)
+            ? historySnapshot()
             : nil
 
         let dirty: CGRect?
@@ -109,6 +119,8 @@ public final class CanvasStore {
         case .layerBlend(let p):      dirty = try doLayerBlend(p)
         case .layerLock(let p):       dirty = try doLayerLock(p)
         case .layerActivate(let p):   dirty = try doLayerActivate(p)
+        case .gridConfig(let p):      dirty = doGridConfig(p)
+        case .gridFill(let p):        dirty = try drawGridFill(p)
         }
 
         revision += 1
@@ -195,12 +207,86 @@ public final class CanvasStore {
             width: width,
             height: height,
             revision: revision,
+            grid: grid,
             lastCommands: lastCommands,
             authorCursors: authorCursors
         )
     }
 
     public var layerState: LayerStackState { stack.state }
+
+    public func gridCells(touching rect: CGRect) -> [GridCell] {
+        grid.cells(touching: rect, canvasWidth: width, canvasHeight: height)
+    }
+
+    public func gridMaskImage(layerID: String) throws -> CGImage {
+        guard stack.layer(id: layerID) != nil else {
+            throw GlossError.notFound("Layer '\(layerID)' not found.")
+        }
+        let spec = grid.normalized(canvasWidth: width, canvasHeight: height)
+        let cols = spec.columns(canvasWidth: width)
+        let rows = spec.rows(canvasHeight: height)
+        guard cols > 0, rows > 0 else {
+            throw GlossError.bad("Grid has no cells at the current canvas size.")
+        }
+        var mask = [UInt8](repeating: 255, count: cols * rows * 4)
+        if let layerCells = gridCellsByLayer[layerID] {
+            for cell in layerCells.keys {
+                guard cell.cx >= 0, cell.cy >= 0, cell.cx < cols, cell.cy < rows else { continue }
+                let offset = (cell.cy * cols + cell.cx) * 4
+                mask[offset + 0] = 0
+                mask[offset + 1] = 0
+                mask[offset + 2] = 0
+                mask[offset + 3] = 255
+            }
+        }
+
+        let data = NSData(bytes: mask, length: mask.count)
+        guard let provider = CGDataProvider(data: data),
+              let image = CGImage(
+                width: cols,
+                height: rows,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: cols * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw GlossError.internalError("Could not encode grid mask image.")
+        }
+        return image
+    }
+
+    public func gridState(layerID: String) throws -> GridLayerState {
+        guard stack.layer(id: layerID) != nil else {
+            throw GlossError.notFound("Layer '\(layerID)' not found.")
+        }
+        let spec = grid.normalized(canvasWidth: width, canvasHeight: height)
+        let cols = spec.columns(canvasWidth: width)
+        let rows = spec.rows(canvasHeight: height)
+        var entries: [GridFilledCell] = []
+        if let cells = gridCellsByLayer[layerID] {
+            entries.reserveCapacity(cells.count)
+            for (cell, color) in cells {
+                guard cell.cx >= 0, cell.cy >= 0, cell.cx < cols, cell.cy < rows else { continue }
+                entries.append(GridFilledCell(cx: cell.cx, cy: cell.cy, color: color.toHex()))
+            }
+            entries.sort {
+                $0.cy == $1.cy ? $0.cx < $1.cx : $0.cy < $1.cy
+            }
+        }
+        return GridLayerState(
+            layerID: layerID,
+            grid: spec,
+            cols: cols,
+            rows: rows,
+            filledCells: entries
+        )
+    }
 
     // MARK: - Layer command implementations
 
@@ -211,6 +297,7 @@ public final class CanvasStore {
 
     private func doLayerDelete(_ p: LayerDeletePayload) throws -> CGRect {
         try stack.deleteLayer(id: p.id)
+        gridCellsByLayer.removeValue(forKey: p.id)
         return CGRect(x: 0, y: 0, width: width, height: height)
     }
 
@@ -244,6 +331,18 @@ public final class CanvasStore {
         return .null
     }
 
+    private func doGridConfig(_ p: GridConfigPayload) -> CGRect {
+        let prior = grid
+        grid = p.merged(with: grid, canvasWidth: width, canvasHeight: height)
+        if prior.cellW != grid.cellW || prior.cellH != grid.cellH ||
+            prior.originX != grid.originX || prior.originY != grid.originY {
+            gridCellsByLayer.removeAll()
+        } else {
+            pruneGridCells()
+        }
+        return .null
+    }
+
     // MARK: - Drawing implementations
 
     private func drawStroke(_ p: StrokePayload) throws -> CGRect {
@@ -263,7 +362,7 @@ public final class CanvasStore {
 
         if usesEngine {
             // Smooth/flatten first via StrokeSmoother for visual consistency.
-            let cgPoints = p.points.map(\.cgPoint)
+            let cgPoints = snapped(points: p.points).map(\.cgPoint)
             let path = StrokeSmoother.smoothPath(
                 points: cgPoints,
                 tension: 0.5,
@@ -278,7 +377,7 @@ public final class CanvasStore {
                 blend: p.blend,
                 brush: brush,
                 brushAngle: p.brushAngle ?? 0,
-                pressures: p.pressures,
+                pressures: p.pressures.flatMap { remap(pressures: $0, toCount: flattened.count) },
                 taper: taper,
                 seed: BrushEngine.seed(
                     idempotencyKey: p.idempotencyKey,
@@ -294,7 +393,7 @@ public final class CanvasStore {
             let pad = max(2, p.width * 1.2)
             return bbox.insetBy(dx: -pad, dy: -pad)
         } else {
-            let cgPoints = p.points.map(\.cgPoint)
+            let cgPoints = snapped(points: p.points).map(\.cgPoint)
             let path = StrokeSmoother.smoothPath(
                 points: cgPoints,
                 tension: 0.5,
@@ -524,9 +623,10 @@ public final class CanvasStore {
 
     private func drawPixel(_ p: PixelPayload) throws -> CGRect {
         let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
-        guard p.x >= 0, p.x < width, p.y >= 0, p.y < height else { return .null }
-        writePixel(into: target.context, x: p.x, y: p.y, color: p.color, blend: p.blend)
-        return CGRect(x: p.x, y: p.y, width: 1, height: 1)
+        let point = snappedPixel(x: p.x, y: p.y)
+        guard point.x >= 0, point.x < width, point.y >= 0, point.y < height else { return .null }
+        writePixel(into: target.context, x: point.x, y: point.y, color: p.color, blend: p.blend)
+        return CGRect(x: point.x, y: point.y, width: 1, height: 1)
     }
 
     private func drawPixels(_ p: PixelsPayload) throws -> CGRect {
@@ -535,15 +635,64 @@ public final class CanvasStore {
         let fallback = p.defaultColor
         for px in p.pixels {
             let color = px.color ?? fallback ?? GlossColor(r: 0, g: 0, b: 0)
-            guard px.x >= 0, px.x < width, px.y >= 0, px.y < height else { continue }
-            writePixel(into: target.context, x: px.x, y: px.y, color: color, blend: p.blend)
-            if px.x < minX { minX = px.x }
-            if px.y < minY { minY = px.y }
-            if px.x > maxX { maxX = px.x }
-            if px.y > maxY { maxY = px.y }
+            let point = snappedPixel(x: px.x, y: px.y)
+            guard point.x >= 0, point.x < width, point.y >= 0, point.y < height else { continue }
+            writePixel(into: target.context, x: point.x, y: point.y, color: color, blend: p.blend)
+            if point.x < minX { minX = point.x }
+            if point.y < minY { minY = point.y }
+            if point.x > maxX { maxX = point.x }
+            if point.y > maxY { maxY = point.y }
         }
         if minX == Int.max { return .null }
         return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    private func drawGridFill(_ p: GridFillPayload) throws -> CGRect {
+        guard !p.cells.isEmpty else {
+            throw GlossError.bad("Grid fill requires at least one cell.")
+        }
+        let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
+        let uniqueCells = Array(Set(p.cells)).sorted {
+            $0.cy == $1.cy ? $0.cx < $1.cx : $0.cy < $1.cy
+        }
+        var rects: [CGRect] = []
+        rects.reserveCapacity(uniqueCells.count)
+        for cell in uniqueCells {
+            guard let rect = grid.rect(for: cell, canvasWidth: width, canvasHeight: height) else {
+                throw GlossError.bad("Grid cell [\(cell.cx), \(cell.cy)] is outside the current grid.")
+            }
+            rects.append(rect)
+        }
+
+        let effectiveColor = GlossColor(
+            r: p.color.r,
+            g: p.color.g,
+            b: p.color.b,
+            a: p.color.a * p.opacity
+        )
+        let clearsCells = p.blend == .clear || effectiveColor.a <= 0
+        var layerCells = gridCellsByLayer[target.id] ?? [:]
+        for cell in uniqueCells {
+            if clearsCells {
+                layerCells.removeValue(forKey: cell)
+            } else {
+                layerCells[cell] = effectiveColor
+            }
+        }
+        gridCellsByLayer[target.id] = layerCells.isEmpty ? nil : layerCells
+
+        let ctx = target.context
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setBlendMode(p.blend.cgBlend)
+        ctx.setAlpha(p.opacity)
+        ctx.setFillColor(p.color.cgColor)
+        var dirty = CGRect.null
+        for rect in rects {
+            ctx.fill(rect)
+            dirty = dirty.isNull ? rect : dirty.union(rect)
+        }
+        return dirty
     }
 
     private func writePixel(into ctx: CGContext, x: Int, y: Int,
@@ -598,6 +747,7 @@ public final class CanvasStore {
         // A targeted clear with an explicit layerID clears just that layer; a
         // bare clear (no layerID) wipes the active layer.
         let target = try stack.contextForDraw(layerID: p.layerID, author: p.author)
+        gridCellsByLayer.removeValue(forKey: target.id)
         let color = p.color ?? GlossColor(r: 1, g: 1, b: 1)
         let ctx = target.context
         ctx.saveGState()
@@ -610,28 +760,32 @@ public final class CanvasStore {
 
     private func performUndo() -> CGRect {
         guard let entry = undoStack.popLast() else { return .null }
-        let currentSnap = stack.snapshot()
+        let currentSnap = historySnapshot()
         redoStack.append((currentSnap, entry.summary))
         if redoStack.count > undoCap { redoStack.removeFirst() }
-        stack.restore(entry.snapshot)
+        restoreHistorySnapshot(entry.snapshot)
         return CGRect(x: 0, y: 0, width: width, height: height)
     }
 
     private func performRedo() -> CGRect {
         guard let entry = redoStack.popLast() else { return .null }
-        let currentSnap = stack.snapshot()
+        let currentSnap = historySnapshot()
         undoStack.append((currentSnap, entry.summary))
         if undoStack.count > undoCap { undoStack.removeFirst() }
-        stack.restore(entry.snapshot)
+        restoreHistorySnapshot(entry.snapshot)
         return CGRect(x: 0, y: 0, width: width, height: height)
     }
 
     private func performResize(_ p: ResizePayload) -> CGRect {
         if p.preserveContents {
             stack.resizeAll(width: p.width, height: p.height)
+            grid = grid.normalized(canvasWidth: p.width, canvasHeight: p.height)
+            pruneGridCells()
         } else {
             stack.reset(width: p.width, height: p.height,
                         background: GlossColor(r: 1, g: 1, b: 1))
+            grid = grid.normalized(canvasWidth: p.width, canvasHeight: p.height)
+            gridCellsByLayer.removeAll()
         }
         undoStack.removeAll()
         redoStack.removeAll()
@@ -644,7 +798,10 @@ public final class CanvasStore {
             stack.resizeAll(width: p.width, height: p.height)
         } else {
             stack.reset(width: p.width, height: p.height, background: bg)
+            gridCellsByLayer.removeAll()
         }
+        grid = (p.grid ?? GridSpec()).normalized(canvasWidth: p.width, canvasHeight: p.height)
+        pruneGridCells()
         undoStack.removeAll()
         redoStack.removeAll()
         return CGRect(x: 0, y: 0, width: p.width, height: p.height)
@@ -669,12 +826,60 @@ public final class CanvasStore {
             return nil
         case .pixel(let p): return GlossPoint(x: Double(p.x), y: Double(p.y))
         case .pixels(let p): return p.pixels.last.map { GlossPoint(x: Double($0.x), y: Double($0.y)) }
+        case .gridFill(let p):
+            guard let cell = p.cells.last,
+                  let rect = grid.rect(for: cell, canvasWidth: width, canvasHeight: height) else {
+                return nil
+            }
+            return GlossPoint(x: rect.minX, y: rect.minY)
         case .clear, .undo, .redo, .resize, .canvasNew,
              .layerCreate, .layerDelete, .layerReorder,
              .layerVisibility, .layerOpacity, .layerBlend,
-             .layerLock, .layerActivate:
+             .layerLock, .layerActivate, .gridConfig:
             return nil
         }
+    }
+
+    private func snapped(points: [GlossPoint]) -> [GlossPoint] {
+        guard grid.snap else { return points }
+        return points.map { point in
+            let snapped = grid.snappedPoint(point.cgPoint, canvasWidth: width, canvasHeight: height)
+            return GlossPoint(x: Double(snapped.x), y: Double(snapped.y))
+        }
+    }
+
+    private func snappedPixel(x: Int, y: Int) -> (x: Int, y: Int) {
+        guard grid.snap else { return (x, y) }
+        let snapped = grid.snappedPoint(CGPoint(x: x, y: y), canvasWidth: width, canvasHeight: height)
+        return (Int(snapped.x.rounded()), Int(snapped.y.rounded()))
+    }
+
+    private func historySnapshot() -> CanvasHistorySnapshot {
+        CanvasHistorySnapshot(
+            stack: stack.snapshot(),
+            grid: grid,
+            gridCellsByLayer: gridCellsByLayer
+        )
+    }
+
+    private func restoreHistorySnapshot(_ snapshot: CanvasHistorySnapshot) {
+        stack.restore(snapshot.stack)
+        grid = snapshot.grid
+        gridCellsByLayer = snapshot.gridCellsByLayer
+        pruneGridCells()
+    }
+
+    private func pruneGridCells() {
+        let cols = grid.columns(canvasWidth: width)
+        let rows = grid.rows(canvasHeight: height)
+        let existingLayerIDs = Set(layerState.layers.map(\.id))
+        let prunedByLayer = gridCellsByLayer.compactMapValues { cells in
+            let pruned = cells.filter { key, _ in
+                key.cx >= 0 && key.cy >= 0 && key.cx < cols && key.cy < rows
+            }
+            return pruned.isEmpty ? nil : pruned
+        }
+        gridCellsByLayer = prunedByLayer.filter { existingLayerIDs.contains($0.key) }
     }
 
     // MARK: - Path flattening helpers

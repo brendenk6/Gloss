@@ -238,6 +238,23 @@ public struct StrokePayload: Codable, Sendable {
         self.blend = blend
         self.simplify = simplify
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case author, idempotencyKey, layerID, points, width, color, opacity, blend, simplify
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.author = try c.decodeIfPresent(String.self, forKey: .author)
+        self.idempotencyKey = try c.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        self.layerID = try c.decodeIfPresent(String.self, forKey: .layerID)
+        self.points = try c.decode([GlossPoint].self, forKey: .points)
+        self.width = max(0.1, try c.decode(Double.self, forKey: .width))
+        self.color = try c.decode(GlossColor.self, forKey: .color)
+        self.opacity = max(0, min(1, try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1))
+        self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
+        self.simplify = try c.decodeIfPresent(Double.self, forKey: .simplify)
+    }
 }
 
 public struct ShapePayload: Codable, Sendable {
@@ -280,6 +297,30 @@ public struct ShapePayload: Codable, Sendable {
         self.opacity = max(0, min(1, opacity))
         self.blend = blend
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case author, idempotencyKey, layerID, kind, x, y, w, h, x2, y2, radius, stroke, strokeWidth, fill, opacity, blend
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.author = try c.decodeIfPresent(String.self, forKey: .author)
+        self.idempotencyKey = try c.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        self.layerID = try c.decodeIfPresent(String.self, forKey: .layerID)
+        self.kind = try c.decode(GlossShapeKind.self, forKey: .kind)
+        self.x = try c.decode(Double.self, forKey: .x)
+        self.y = try c.decode(Double.self, forKey: .y)
+        self.w = try c.decodeIfPresent(Double.self, forKey: .w)
+        self.h = try c.decodeIfPresent(Double.self, forKey: .h)
+        self.x2 = try c.decodeIfPresent(Double.self, forKey: .x2)
+        self.y2 = try c.decodeIfPresent(Double.self, forKey: .y2)
+        self.radius = try c.decodeIfPresent(Double.self, forKey: .radius)
+        self.stroke = try c.decodeIfPresent(GlossColor.self, forKey: .stroke)
+        self.strokeWidth = try c.decodeIfPresent(Double.self, forKey: .strokeWidth)
+        self.fill = try c.decodeIfPresent(GlossColor.self, forKey: .fill)
+        self.opacity = max(0, min(1, try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1))
+        self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
+    }
 }
 
 public struct TextPayload: Codable, Sendable {
@@ -290,8 +331,8 @@ public struct TextPayload: Codable, Sendable {
     public var x: Double
     public var y: Double
     public var fontSize: Double
-    public var fontName: String?      // e.g. "Helvetica", "SF Pro Rounded"
-    public var weight: String?        // "regular", "medium", "bold", "heavy"
+    public var fontName: String?
+    public var weight: String?
     public var color: GlossColor
     public var opacity: Double
     public var blend: GlossBlend
@@ -312,6 +353,26 @@ public struct TextPayload: Codable, Sendable {
         self.color = color
         self.opacity = max(0, min(1, opacity))
         self.blend = blend
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case author, idempotencyKey, layerID, string, x, y, fontSize, fontName, weight, color, opacity, blend
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.author = try c.decodeIfPresent(String.self, forKey: .author)
+        self.idempotencyKey = try c.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        self.layerID = try c.decodeIfPresent(String.self, forKey: .layerID)
+        self.string = try c.decode(String.self, forKey: .string)
+        self.x = try c.decode(Double.self, forKey: .x)
+        self.y = try c.decode(Double.self, forKey: .y)
+        self.fontSize = max(1, try c.decodeIfPresent(Double.self, forKey: .fontSize) ?? 24)
+        self.fontName = try c.decodeIfPresent(String.self, forKey: .fontName)
+        self.weight = try c.decodeIfPresent(String.self, forKey: .weight)
+        self.color = try c.decodeIfPresent(GlossColor.self, forKey: .color) ?? GlossColor(r: 0, g: 0, b: 0)
+        self.opacity = max(0, min(1, try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1))
+        self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
     }
 }
 
@@ -337,6 +398,24 @@ public struct ImagePayload: Codable, Sendable {
         self.x = x; self.y = y; self.w = w; self.h = h
         self.opacity = max(0, min(1, opacity))
         self.blend = blend
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case author, idempotencyKey, layerID, pngBase64, x, y, w, h, opacity, blend
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.author = try c.decodeIfPresent(String.self, forKey: .author)
+        self.idempotencyKey = try c.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        self.layerID = try c.decodeIfPresent(String.self, forKey: .layerID)
+        self.pngBase64 = try c.decode(String.self, forKey: .pngBase64)
+        self.x = try c.decode(Double.self, forKey: .x)
+        self.y = try c.decode(Double.self, forKey: .y)
+        self.w = try c.decodeIfPresent(Double.self, forKey: .w)
+        self.h = try c.decodeIfPresent(Double.self, forKey: .h)
+        self.opacity = max(0, min(1, try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1))
+        self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
     }
 }
 

@@ -136,6 +136,9 @@ public final class CanvasStore {
         case .shape(let p):     dirty = drawShape(p)
         case .text(let p):      dirty = drawText(p)
         case .image(let p):     dirty = drawImage(p)
+        case .path(let p):      dirty = drawPath(p)
+        case .pixel(let p):     dirty = drawPixel(p)
+        case .pixels(let p):    dirty = drawPixels(p)
         case .clear(let p):     dirty = drawClear(p)
         case .undo:             dirty = performUndo()
         case .redo:             dirty = performRedo()
@@ -377,6 +380,140 @@ public final class CanvasStore {
         return rect
     }
 
+    private func drawPath(_ p: PathPayload) -> CGRect {
+        let path = CGMutablePath()
+        for op in p.ops {
+            switch op {
+            case .move(let x, let y):
+                path.move(to: CGPoint(x: x, y: y))
+            case .line(let x, let y):
+                path.addLine(to: CGPoint(x: x, y: y))
+            case .quad(let cx, let cy, let x, let y):
+                path.addQuadCurve(to: CGPoint(x: x, y: y), control: CGPoint(x: cx, y: cy))
+            case .curve(let c1x, let c1y, let c2x, let c2y, let x, let y):
+                path.addCurve(
+                    to: CGPoint(x: x, y: y),
+                    control1: CGPoint(x: c1x, y: c1y),
+                    control2: CGPoint(x: c2x, y: c2y)
+                )
+            case .close:
+                path.closeSubpath()
+            }
+        }
+        if p.closed == true && !path.isEmpty {
+            path.closeSubpath()
+        }
+        guard !path.isEmpty else { return .null }
+
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.setBlendMode(p.blend.cgBlend)
+        context.setAlpha(p.opacity)
+
+        if let fill = p.fill {
+            context.setFillColor(fill.cgColor)
+            context.addPath(path)
+            // Use even-odd to allow self-intersecting polygons to fill predictably.
+            context.fillPath(using: .evenOdd)
+        }
+
+        if let strokeColor = p.color {
+            context.setStrokeColor(strokeColor.cgColor)
+            context.setLineWidth(p.strokeWidth ?? 2)
+            context.setLineCap(p.lineCap?.cgCap ?? .round)
+            context.setLineJoin(p.lineJoin?.cgJoin ?? .round)
+            if let miter = p.miterLimit { context.setMiterLimit(miter) }
+            if let dash = p.dash, !dash.isEmpty {
+                let lengths = dash.map { CGFloat($0) }
+                context.setLineDash(phase: 0, lengths: lengths)
+            }
+            context.addPath(path)
+            context.strokePath()
+        }
+
+        let pad = max(2, p.strokeWidth ?? 0)
+        return path.boundingBoxOfPath.insetBy(dx: -pad, dy: -pad)
+    }
+
+    /// Set a single pixel without antialiasing. Writes directly to the bitmap
+    /// buffer so it's exact even for sub-pixel-aligned color values.
+    private func drawPixel(_ p: PixelPayload) -> CGRect {
+        guard p.x >= 0, p.x < width, p.y >= 0, p.y < height else { return .null }
+        writePixel(x: p.x, y: p.y, color: p.color, blend: p.blend)
+        return CGRect(x: p.x, y: p.y, width: 1, height: 1)
+    }
+
+    /// Batch pixel set. Each pixel may carry its own color or fall back to defaultColor.
+    private func drawPixels(_ p: PixelsPayload) -> CGRect {
+        var minX = Int.max, minY = Int.max, maxX = Int.min, maxY = Int.min
+        let fallback = p.defaultColor
+        for px in p.pixels {
+            let color = px.color ?? fallback ?? GlossColor(r: 0, g: 0, b: 0)
+            guard px.x >= 0, px.x < width, px.y >= 0, px.y < height else { continue }
+            writePixel(x: px.x, y: px.y, color: color, blend: p.blend)
+            if px.x < minX { minX = px.x }
+            if px.y < minY { minY = px.y }
+            if px.x > maxX { maxX = px.x }
+            if px.y > maxY { maxY = px.y }
+        }
+        if minX == Int.max { return .null }
+        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    /// Direct buffer write bypassing CGContext. Bottom-up bitmap, top-left origin
+    /// from caller's perspective, so we flip the row index before writing.
+    private func writePixel(x: Int, y: Int, color: GlossColor, blend: GlossBlend) {
+        guard let data = context.data else { return }
+        let bytesPerRow = context.bytesPerRow
+        let flippedY = (height - 1) - y
+        let offset = flippedY * bytesPerRow + x * 4
+        let ptr = data.assumingMemoryBound(to: UInt8.self)
+
+        let alpha = max(0, min(1, color.a))
+        let dstR = ptr[offset + 0]
+        let dstG = ptr[offset + 1]
+        let dstB = ptr[offset + 2]
+        let dstA = ptr[offset + 3]
+
+        // Premultiplied source channels
+        let srcR = UInt8(round(color.r * alpha * 255))
+        let srcG = UInt8(round(color.g * alpha * 255))
+        let srcB = UInt8(round(color.b * alpha * 255))
+        let srcA = UInt8(round(alpha * 255))
+
+        switch blend {
+        case .normal, .clear:
+            if blend == .clear {
+                ptr[offset + 0] = 0
+                ptr[offset + 1] = 0
+                ptr[offset + 2] = 0
+                ptr[offset + 3] = 0
+                return
+            }
+            if alpha >= 1.0 {
+                ptr[offset + 0] = srcR
+                ptr[offset + 1] = srcG
+                ptr[offset + 2] = srcB
+                ptr[offset + 3] = 255
+                return
+            }
+            // Source-over: out = src + dst*(1-src.a)
+            let inv = 1.0 - alpha
+            ptr[offset + 0] = UInt8(min(255, Int(round(Double(srcR) + Double(dstR) * inv))))
+            ptr[offset + 1] = UInt8(min(255, Int(round(Double(srcG) + Double(dstG) * inv))))
+            ptr[offset + 2] = UInt8(min(255, Int(round(Double(srcB) + Double(dstB) * inv))))
+            ptr[offset + 3] = UInt8(min(255, Int(round(Double(srcA) + Double(dstA) * inv))))
+        default:
+            // Fall back to source-over for non-normal blends in the fast path.
+            // For exotic blends call /pixel via /shape rect 1x1 with blend instead.
+            let inv = 1.0 - alpha
+            ptr[offset + 0] = UInt8(min(255, Int(round(Double(srcR) + Double(dstR) * inv))))
+            ptr[offset + 1] = UInt8(min(255, Int(round(Double(srcG) + Double(dstG) * inv))))
+            ptr[offset + 2] = UInt8(min(255, Int(round(Double(srcB) + Double(dstB) * inv))))
+            ptr[offset + 3] = UInt8(min(255, Int(round(Double(srcA) + Double(dstA) * inv))))
+        }
+    }
+
     private func drawClear(_ p: ClearPayload) -> CGRect {
         let color = p.color ?? GlossColor(r: 1, g: 1, b: 1)
         context.saveGState()
@@ -442,6 +579,20 @@ public final class CanvasStore {
         case .shape(let p): return GlossPoint(x: p.x, y: p.y)
         case .text(let p): return GlossPoint(x: p.x, y: p.y)
         case .image(let p): return GlossPoint(x: p.x, y: p.y)
+        case .path(let p):
+            // Return the last absolute point in the ops list
+            for op in p.ops.reversed() {
+                switch op {
+                case .move(let x, let y): return GlossPoint(x: x, y: y)
+                case .line(let x, let y): return GlossPoint(x: x, y: y)
+                case .quad(_, _, let x, let y): return GlossPoint(x: x, y: y)
+                case .curve(_, _, _, _, let x, let y): return GlossPoint(x: x, y: y)
+                case .close: continue
+                }
+            }
+            return nil
+        case .pixel(let p): return GlossPoint(x: Double(p.x), y: Double(p.y))
+        case .pixels(let p): return p.pixels.last.map { GlossPoint(x: Double($0.x), y: Double($0.y)) }
         case .clear, .undo, .redo, .resize: return nil
         }
     }

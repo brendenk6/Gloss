@@ -128,6 +128,9 @@ public enum DrawCommand: Codable, Sendable {
     case shape(ShapePayload)
     case text(TextPayload)
     case image(ImagePayload)
+    case path(PathPayload)
+    case pixel(PixelPayload)
+    case pixels(PixelsPayload)
     case clear(ClearPayload)
     case undo(MetaPayload)
     case redo(MetaPayload)
@@ -141,6 +144,9 @@ public enum DrawCommand: Codable, Sendable {
         case .shape(let p): return p.author
         case .text(let p): return p.author
         case .image(let p): return p.author
+        case .path(let p): return p.author
+        case .pixel(let p): return p.author
+        case .pixels(let p): return p.author
         case .clear(let p): return p.author
         case .undo(let p): return p.author
         case .redo(let p): return p.author
@@ -154,6 +160,9 @@ public enum DrawCommand: Codable, Sendable {
         case .shape(let p): return p.idempotencyKey
         case .text(let p): return p.idempotencyKey
         case .image(let p): return p.idempotencyKey
+        case .path(let p): return p.idempotencyKey
+        case .pixel(let p): return p.idempotencyKey
+        case .pixels(let p): return p.idempotencyKey
         case .clear(let p): return p.idempotencyKey
         case .undo(let p): return p.idempotencyKey
         case .redo(let p): return p.idempotencyKey
@@ -168,6 +177,9 @@ public enum DrawCommand: Codable, Sendable {
         case .shape: return "shape"
         case .text: return "text"
         case .image: return "image"
+        case .path: return "path"
+        case .pixel: return "pixel"
+        case .pixels: return "pixels"
         case .clear: return "clear"
         case .undo: return "undo"
         case .redo: return "redo"
@@ -188,6 +200,9 @@ public enum DrawCommand: Codable, Sendable {
         case "shape":  self = .shape(try single.decode(ShapePayload.self))
         case "text":   self = .text(try single.decode(TextPayload.self))
         case "image":  self = .image(try single.decode(ImagePayload.self))
+        case "path":   self = .path(try single.decode(PathPayload.self))
+        case "pixel":  self = .pixel(try single.decode(PixelPayload.self))
+        case "pixels": self = .pixels(try single.decode(PixelsPayload.self))
         case "clear":  self = .clear(try single.decode(ClearPayload.self))
         case "undo":   self = .undo(try single.decode(MetaPayload.self))
         case "redo":   self = .redo(try single.decode(MetaPayload.self))
@@ -204,6 +219,9 @@ public enum DrawCommand: Codable, Sendable {
         case .shape(let p):  try single.encode(_TaggedEncode(type: "shape",  payload: p))
         case .text(let p):   try single.encode(_TaggedEncode(type: "text",   payload: p))
         case .image(let p):  try single.encode(_TaggedEncode(type: "image",  payload: p))
+        case .path(let p):   try single.encode(_TaggedEncode(type: "path",   payload: p))
+        case .pixel(let p):  try single.encode(_TaggedEncode(type: "pixel",  payload: p))
+        case .pixels(let p): try single.encode(_TaggedEncode(type: "pixels", payload: p))
         case .clear(let p):  try single.encode(_TaggedEncode(type: "clear",  payload: p))
         case .undo(let p):   try single.encode(_TaggedEncode(type: "undo",   payload: p))
         case .redo(let p):   try single.encode(_TaggedEncode(type: "redo",   payload: p))
@@ -547,4 +565,249 @@ private struct _TaggedEncode<T: Encodable>: Encodable {
         try c.encode(type, forKey: .type)
     }
     private enum TypeKey: String, CodingKey { case type }
+}
+
+// MARK: - Line cap / join
+
+public enum GlossLineCap: String, Codable, Sendable {
+    case round, square, butt
+    public var cgCap: CGLineCap {
+        switch self {
+        case .round: return .round
+        case .square: return .square
+        case .butt: return .butt
+        }
+    }
+}
+
+public enum GlossLineJoin: String, Codable, Sendable {
+    case round, miter, bevel
+    public var cgJoin: CGLineJoin {
+        switch self {
+        case .round: return .round
+        case .miter: return .miter
+        case .bevel: return .bevel
+        }
+    }
+}
+
+// MARK: - Path operations (SVG-style)
+
+/// One segment of a path. Tagged-union encoded as
+/// `{"op":"M","x":10,"y":10}`, `{"op":"L","x":20,"y":20}`,
+/// `{"op":"Q","cx":..,"cy":..,"x":..,"y":..}`,
+/// `{"op":"C","c1x":..,"c1y":..,"c2x":..,"c2y":..,"x":..,"y":..}`,
+/// `{"op":"Z"}` (close).
+public enum PathOp: Codable, Sendable {
+    case move(x: Double, y: Double)
+    case line(x: Double, y: Double)
+    case quad(cx: Double, cy: Double, x: Double, y: Double)
+    case curve(c1x: Double, c1y: Double, c2x: Double, c2y: Double, x: Double, y: Double)
+    case close
+
+    private enum CodingKeys: String, CodingKey {
+        case op, x, y, cx, cy, c1x, c1y, c2x, c2y
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let op = try c.decode(String.self, forKey: .op).uppercased()
+        switch op {
+        case "M":
+            self = .move(x: try c.decode(Double.self, forKey: .x),
+                         y: try c.decode(Double.self, forKey: .y))
+        case "L":
+            self = .line(x: try c.decode(Double.self, forKey: .x),
+                         y: try c.decode(Double.self, forKey: .y))
+        case "Q":
+            self = .quad(
+                cx: try c.decode(Double.self, forKey: .cx),
+                cy: try c.decode(Double.self, forKey: .cy),
+                x: try c.decode(Double.self, forKey: .x),
+                y: try c.decode(Double.self, forKey: .y))
+        case "C":
+            self = .curve(
+                c1x: try c.decode(Double.self, forKey: .c1x),
+                c1y: try c.decode(Double.self, forKey: .c1y),
+                c2x: try c.decode(Double.self, forKey: .c2x),
+                c2y: try c.decode(Double.self, forKey: .c2y),
+                x: try c.decode(Double.self, forKey: .x),
+                y: try c.decode(Double.self, forKey: .y))
+        case "Z":
+            self = .close
+        default:
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown path op \(op)"))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .move(let x, let y):
+            try c.encode("M", forKey: .op)
+            try c.encode(x, forKey: .x); try c.encode(y, forKey: .y)
+        case .line(let x, let y):
+            try c.encode("L", forKey: .op)
+            try c.encode(x, forKey: .x); try c.encode(y, forKey: .y)
+        case .quad(let cx, let cy, let x, let y):
+            try c.encode("Q", forKey: .op)
+            try c.encode(cx, forKey: .cx); try c.encode(cy, forKey: .cy)
+            try c.encode(x, forKey: .x); try c.encode(y, forKey: .y)
+        case .curve(let c1x, let c1y, let c2x, let c2y, let x, let y):
+            try c.encode("C", forKey: .op)
+            try c.encode(c1x, forKey: .c1x); try c.encode(c1y, forKey: .c1y)
+            try c.encode(c2x, forKey: .c2x); try c.encode(c2y, forKey: .c2y)
+            try c.encode(x, forKey: .x); try c.encode(y, forKey: .y)
+        case .close:
+            try c.encode("Z", forKey: .op)
+        }
+    }
+}
+
+public struct PathPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var layerID: String?
+    public var ops: [PathOp]
+    /// Stroke color (omit for fill-only)
+    public var color: GlossColor?
+    public var strokeWidth: Double?
+    /// Fill color (omit for stroke-only)
+    public var fill: GlossColor?
+    public var opacity: Double
+    public var blend: GlossBlend
+    public var lineCap: GlossLineCap?
+    public var lineJoin: GlossLineJoin?
+    public var miterLimit: Double?
+    public var dash: [Double]?
+    /// If true, ensures the path is closed before stroking/filling even if it
+    /// doesn't end with Z.
+    public var closed: Bool?
+
+    public init(author: String? = nil, idempotencyKey: String? = nil, layerID: String? = nil,
+                ops: [PathOp],
+                color: GlossColor? = nil, strokeWidth: Double? = nil,
+                fill: GlossColor? = nil,
+                opacity: Double = 1, blend: GlossBlend = .normal,
+                lineCap: GlossLineCap? = nil, lineJoin: GlossLineJoin? = nil,
+                miterLimit: Double? = nil, dash: [Double]? = nil,
+                closed: Bool? = nil) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.layerID = layerID
+        self.ops = ops
+        self.color = color
+        self.strokeWidth = strokeWidth
+        self.fill = fill
+        self.opacity = max(0, min(1, opacity))
+        self.blend = blend
+        self.lineCap = lineCap
+        self.lineJoin = lineJoin
+        self.miterLimit = miterLimit
+        self.dash = dash
+        self.closed = closed
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case author, idempotencyKey, layerID, ops, color, strokeWidth, fill, opacity, blend, lineCap, lineJoin, miterLimit, dash, closed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.author = try c.decodeIfPresent(String.self, forKey: .author)
+        self.idempotencyKey = try c.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        self.layerID = try c.decodeIfPresent(String.self, forKey: .layerID)
+        self.ops = try c.decode([PathOp].self, forKey: .ops)
+        self.color = try c.decodeIfPresent(GlossColor.self, forKey: .color)
+        self.strokeWidth = try c.decodeIfPresent(Double.self, forKey: .strokeWidth)
+        self.fill = try c.decodeIfPresent(GlossColor.self, forKey: .fill)
+        self.opacity = max(0, min(1, try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 1))
+        self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
+        self.lineCap = try c.decodeIfPresent(GlossLineCap.self, forKey: .lineCap)
+        self.lineJoin = try c.decodeIfPresent(GlossLineJoin.self, forKey: .lineJoin)
+        self.miterLimit = try c.decodeIfPresent(Double.self, forKey: .miterLimit)
+        self.dash = try c.decodeIfPresent([Double].self, forKey: .dash)
+        self.closed = try c.decodeIfPresent(Bool.self, forKey: .closed)
+    }
+}
+
+// MARK: - Pixel set commands
+
+public struct PixelPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var layerID: String?
+    public var x: Int
+    public var y: Int
+    public var color: GlossColor
+    public var blend: GlossBlend
+
+    public init(author: String? = nil, idempotencyKey: String? = nil, layerID: String? = nil,
+                x: Int, y: Int, color: GlossColor, blend: GlossBlend = .normal) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.layerID = layerID
+        self.x = x; self.y = y
+        self.color = color
+        self.blend = blend
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case author, idempotencyKey, layerID, x, y, color, blend
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.author = try c.decodeIfPresent(String.self, forKey: .author)
+        self.idempotencyKey = try c.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        self.layerID = try c.decodeIfPresent(String.self, forKey: .layerID)
+        self.x = try c.decode(Int.self, forKey: .x)
+        self.y = try c.decode(Int.self, forKey: .y)
+        self.color = try c.decode(GlossColor.self, forKey: .color)
+        self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
+    }
+}
+
+public struct GlossPixel: Codable, Sendable {
+    public var x: Int
+    public var y: Int
+    /// If nil, use PixelsPayload.defaultColor.
+    public var color: GlossColor?
+    public init(x: Int, y: Int, color: GlossColor? = nil) {
+        self.x = x; self.y = y; self.color = color
+    }
+}
+
+public struct PixelsPayload: Codable, Sendable {
+    public var author: String?
+    public var idempotencyKey: String?
+    public var layerID: String?
+    public var pixels: [GlossPixel]
+    /// Used when individual pixels don't specify their own color.
+    public var defaultColor: GlossColor?
+    public var blend: GlossBlend
+
+    public init(author: String? = nil, idempotencyKey: String? = nil, layerID: String? = nil,
+                pixels: [GlossPixel], defaultColor: GlossColor? = nil, blend: GlossBlend = .normal) {
+        self.author = author
+        self.idempotencyKey = idempotencyKey
+        self.layerID = layerID
+        self.pixels = pixels
+        self.defaultColor = defaultColor
+        self.blend = blend
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case author, idempotencyKey, layerID, pixels, defaultColor, blend
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.author = try c.decodeIfPresent(String.self, forKey: .author)
+        self.idempotencyKey = try c.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        self.layerID = try c.decodeIfPresent(String.self, forKey: .layerID)
+        self.pixels = try c.decode([GlossPixel].self, forKey: .pixels)
+        self.defaultColor = try c.decodeIfPresent(GlossColor.self, forKey: .defaultColor)
+        self.blend = try c.decodeIfPresent(GlossBlend.self, forKey: .blend) ?? .normal
+    }
 }

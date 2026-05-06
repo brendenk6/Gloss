@@ -88,18 +88,30 @@ Draw commands can include `layerID`. If omitted, Gloss draws on the active layer
 
 Layer order is bottom to top. Index `0` is the bottom layer.
 
+### Grid
+
+The grid is an exact cell data layer over the canvas, not a screenshot heuristic. Use `/grid/state` to verify fills by stable `(cx, cy)` cell IDs. `/grid/mask.png` is derived from that same ledger, one PNG pixel per cell. Strokes and raw pixel writes may snap to cell boundaries when `grid.snap=true`, but only `/grid/fill` changes the grid ledger.
+
 ### Brushes
 
 `/stroke` and `/path` support:
 
 ```text
-brush: round | calligraphy | marker | pencil | airbrush | chalk
+brush: round | calligraphy | marker | pencil | airbrush | chalk | ink | ribbon | glaze
 brushAngle: radians, used by calligraphy
 pressures: 0...1 values for variable width
 taper: in | out | both | none
 ```
 
 For `/stroke`, `pressures` must match `points.count`. For `/path`, pressures are mapped over the flattened path by arclength.
+
+Brush intent:
+
+```text
+ink: solid pressure-responsive wet line with a soft shoulder
+ribbon: flat flexible nib for broad-to-hairline calligraphic curves
+glaze: translucent marker wash with feathered edges and buildable color
+```
 
 ### Command Result
 
@@ -136,6 +148,9 @@ Errors return:
 | GET | `/state` | Canvas state, recent commands, cursors, layer state |
 | GET | `/layers`, `/layer/list` | Layer stack only |
 | GET | `/canvas/presets` | Named canvas size presets |
+| GET | `/grid/state` | Exact filled-cell data for one layer |
+| GET | `/grid/cells` | Grid cell geometry touching a canvas region |
+| GET | `/grid/mask.png`, `/grid/mask` | One-pixel-per-cell mask from exact grid data |
 | GET | `/canvas.png`, `/canvas` | Composite PNG, optional `max_dim` |
 | GET | `/export` | Downloadable composite PNG |
 | GET | `/region.png`, `/canvas/region.png`, `/region` | Cropped composite PNG |
@@ -150,6 +165,8 @@ Errors return:
 | POST | `/shape`, `/text`, `/image`, `/image_paste` | Basic drawing primitives |
 | POST | `/clear`, `/undo`, `/redo` | History and canvas clearing |
 | POST | `/resize`, `/canvas/new` | Canvas size and reset operations |
+| POST | `/grid/config` | Configure grid cell size, origin, visibility, opacity, snap |
+| POST | `/grid/fill` | Fill exact cells and record them in the grid ledger |
 | POST | `/layer/create` | Create a layer; response includes `layer` |
 | POST | `/layer/delete` | Delete a layer |
 | POST | `/layer/reorder` | Move a layer; `toIndex=0` means bottom |
@@ -175,6 +192,7 @@ Response:
   "width": 1024,
   "height": 1024,
   "revision": 0,
+  "grid": {"cell_w": 16, "cell_h": 16, "origin_x": 0, "origin_y": 0, "visible": false, "opacity": 0.35, "snap": false},
   "lastCommands": [],
   "authorCursors": {},
   "layerState": {
@@ -205,18 +223,22 @@ curl -s http://127.0.0.1:7778/layer/list | python3 -m json.tool
 
 ### GET /canvas/presets
 
-Lists named canvas size presets.
+Lists named canvas size presets. Each preset includes a default `grid` sized to keep the long axis near agent-manageable training resolution.
 
 ```bash
 curl -s http://127.0.0.1:7778/canvas/presets | python3 -m json.tool
 ```
 
-Current presets:
+Families:
 
 ```text
-1024_square, 2048_square, 4096_square, 1080x1920_portrait,
-1920x1080_landscape, 800x600_classic, 512_square
+Animation: tv_hd, tv_fhd, tv_uhd, tv_dci, tv_ntsc
+iPhone: iphone_se, iphone_16, iphone_16_plus, iphone_16_pro, iphone_16_pro_max
+iPad: ipad_mini, ipad_pro_11, ipad_air_13, ipad_pro_13
+Studio/social: square_1k, square_2k, study_default
 ```
+
+All non-square landscape presets also have a `_portrait` variant, for example `iphone_16_portrait`.
 
 ### GET /canvas.png
 
@@ -365,6 +387,58 @@ Response:
     {"index": 0, "x": 10, "y": 10, "rgba": {"r": 255, "g": 255, "b": 255, "a": 255}}
   ]
 }
+```
+
+### GET /grid/state
+
+Returns the canonical grid data for one layer. This is the verification source for grid training. It does not inspect rendered pixels.
+
+```bash
+curl -s 'http://127.0.0.1:7778/grid/state?layerID=codex-layer' | python3 -m json.tool
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "revision": 12,
+  "layerID": "codex-layer",
+  "grid": {"cell_w": 16, "cell_h": 16, "origin_x": 0, "origin_y": 0, "visible": true, "opacity": 0.5, "snap": true},
+  "cols": 64,
+  "rows": 64,
+  "filled_cells": [[1, 1, "#FF0000"], [2, 1, "#FF0000"]]
+}
+```
+
+### GET /grid/cells
+
+Returns stable cell IDs and canvas rectangles for every cell touching a region.
+
+```bash
+curl -s 'http://127.0.0.1:7778/grid/cells?x=0&y=0&w=33&h=17' | python3 -m json.tool
+```
+
+Each cell is:
+
+```json
+{"cx": 0, "cy": 0, "x": 0, "y": 0, "w": 16, "h": 16}
+```
+
+Queries are capped at 100,000 cells.
+
+### GET /grid/mask.png
+
+Returns a PNG with dimensions `cols x rows`, where each image pixel represents one grid cell. Filled cells are black; empty cells are white. The mask is derived from `/grid/state` data, not from canvas pixels.
+
+```bash
+curl -s 'http://127.0.0.1:7778/grid/mask.png?layerID=codex-layer' -o codex-grid-mask.png
+```
+
+Alias:
+
+```bash
+curl -s 'http://127.0.0.1:7778/grid/mask?layerID=codex-layer' -o codex-grid-mask.png
 ```
 
 ### GET /diff
@@ -565,7 +639,7 @@ lineJoin: round | miter | bevel
 miterLimit: optional numeric miter limit
 dash: optional dash lengths array
 closed: true to close before drawing
-brush: round | calligraphy | marker | pencil | airbrush | chalk
+brush: round | calligraphy | marker | pencil | airbrush | chalk | ink | ribbon | glaze
 brushAngle: radians, used by calligraphy
 pressures: optional pressure values mapped over flattened arclength
 taper: in | out | both | none
@@ -653,12 +727,21 @@ Payload:
 
 ### POST /canvas/new
 
-Starts a fresh canvas. Unlike `/resize`, this can either reset to one base layer or preserve the layer stack while resizing every layer bitmap.
+Starts a fresh canvas. Unlike `/resize`, this can either reset to one base layer or preserve the layer stack while resizing every layer bitmap. Use either explicit `width` and `height`, or a named `preset` from `/canvas/presets`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:7778/canvas/new \
   -H 'Content-Type: application/json' \
   -d '{"author":"codex","width":2048,"height":2048,"background":"#FFFFFF","preserveLayers":false}' \
+  | python3 -m json.tool
+```
+
+Preset-only:
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/canvas/new \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","preset":"tv_fhd","background":"#FFFFFF","preserveLayers":false}' \
   | python3 -m json.tool
 ```
 
@@ -668,12 +751,66 @@ Payload:
 {
   "author": "codex",
   "idempotencyKey": "codex-new-001",
+  "preset": "tv_fhd",
   "width": 2048,
   "height": 2048,
   "background": "#FFFFFF",
+  "grid": {"cell_w": 16, "cell_h": 16, "origin_x": 0, "origin_y": 0, "visible": false, "opacity": 0.35, "snap": false},
   "preserveLayers": false
 }
 ```
+
+If `preset` is present, omitted `width`, `height`, and `grid` are filled from that preset. Explicit values override the preset.
+
+### POST /grid/config
+
+Configures the grid. Cell sizes are clamped to a minimum of `4 x 4`.
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/grid/config \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","cell_w":16,"cell_h":16,"origin_x":0,"origin_y":0,"visible":true,"opacity":0.5,"snap":true}' \
+  | python3 -m json.tool
+```
+
+Payload fields:
+
+```text
+cell_w, cell_h: grid cell size in canvas pixels
+origin_x, origin_y: grid origin in canvas pixels
+visible: whether the app overlays grid lines
+opacity: overlay opacity, 0...1
+snap: whether stroke and pixel commands snap coordinates to cell boundaries
+```
+
+Changing cell size or origin clears recorded grid cells because old cell IDs no longer describe the same geometry. Visibility, opacity, and snap changes preserve the grid ledger.
+
+### POST /grid/fill
+
+Fills exact cells on a layer and records those cells in `/grid/state`.
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/grid/fill \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","layerID":"codex-layer","cells":[[1,1],[2,1]],"color":"#FF0000"}' \
+  | python3 -m json.tool
+```
+
+Payload:
+
+```json
+{
+  "author": "codex",
+  "idempotencyKey": "codex-grid-fill-001",
+  "layerID": "codex-layer",
+  "cells": [[1, 1], [2, 1], {"cx": 3, "cy": 1}],
+  "color": "#FF0000",
+  "opacity": 1,
+  "blend": "normal"
+}
+```
+
+Use `blend:"clear"` or a zero-alpha color to clear cells from the ledger. `/grid/state` reports only cells written through `/grid/fill`; this is deliberate so training verification reads exact data instead of rendered pixels.
 
 ### Layer Mutations
 

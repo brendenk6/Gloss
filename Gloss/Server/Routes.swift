@@ -105,6 +105,15 @@ enum GlossRoutes {
             case ("GET", "/canvas/presets"):
                 return .json(CanvasPresetsEnvelope(presets: GlossCanvasPresets.all))
 
+            case ("GET", "/grid/cells"):
+                return gridCells(query: query, store: store)
+
+            case ("GET", "/grid/state"):
+                return gridState(query: query, store: store)
+
+            case ("GET", "/grid/mask.png"), ("GET", "/grid/mask"):
+                return gridMask(query: query, store: store)
+
             case ("GET", "/canvas.png"), ("GET", "/canvas"):
                 let maxDim = intParam(query, "max_dim") ?? intParam(query, "maxDim")
                 let image = store.snapshot(maxDim: maxDim)
@@ -191,7 +200,7 @@ enum GlossRoutes {
                 idempotency.clear()
                 return response
             case ("POST", "/canvas/new"):
-                let response = try apply(body: body, inferredType: "canvasNew", store: store, idempotency: idempotency)
+                let response = try applyCanvasNew(body: body, store: store, idempotency: idempotency)
                 idempotency.clear()
                 return response
             case ("POST", "/layer/create"):
@@ -210,6 +219,10 @@ enum GlossRoutes {
                 return try apply(body: body, inferredType: "layerLock", store: store, idempotency: idempotency)
             case ("POST", "/layer/activate"), ("POST", "/layer/active"):
                 return try apply(body: body, inferredType: "layerActivate", store: store, idempotency: idempotency)
+            case ("POST", "/grid/config"):
+                return try apply(body: body, inferredType: "gridConfig", store: store, idempotency: idempotency)
+            case ("POST", "/grid/fill"):
+                return try apply(body: body, inferredType: "gridFill", store: store, idempotency: idempotency)
 
             default:
                 return .error(code: "not_found", message: "Unknown route: \(method) \(path)", status: 404)
@@ -274,6 +287,55 @@ enum GlossRoutes {
             layerState: store.layerState,
             dedupedByServer: false
         ))
+    }
+
+    private static func applyCanvasNew(
+        body: Data,
+        store: CanvasStore,
+        idempotency: ServerIdempotencyCache
+    ) throws -> GlossHTTPResponse {
+        let source = body.isEmpty ? Data("{}".utf8) : body
+        let jsonObject: Any
+        do {
+            jsonObject = try JSONSerialization.jsonObject(with: source)
+        } catch {
+            throw GlossError(code: "bad_json", message: "Invalid JSON body: \(error.localizedDescription)")
+        }
+        guard var object = jsonObject as? [String: Any] else {
+            throw GlossError(code: "bad_json", message: "Expected a JSON object body.")
+        }
+        object["type"] = object["type"] ?? "canvasNew"
+
+        if let presetName = object["preset"] as? String {
+            guard let preset = GlossCanvasPresets.resolve(presetName) else {
+                throw GlossError.bad("Unknown canvas preset '\(presetName)'. Call /canvas/presets for valid names.")
+            }
+            object["width"] = object["width"] ?? preset.width
+            object["height"] = object["height"] ?? preset.height
+            object["grid"] = object["grid"] ?? [
+                "cell_w": preset.grid.cellW,
+                "cell_h": preset.grid.cellH,
+                "origin_x": preset.grid.originX,
+                "origin_y": preset.grid.originY,
+                "visible": preset.grid.visible,
+                "opacity": preset.grid.opacity,
+                "snap": preset.grid.snap
+            ]
+        }
+
+        guard object["width"] != nil, object["height"] != nil else {
+            throw GlossError.bad("Canvas new requires width and height, or a valid preset.")
+        }
+
+        let normalized = try JSONSerialization.data(withJSONObject: object)
+        let command = try JSONDecoder().decode(DrawCommand.self, from: normalized)
+
+        if let key = command.idempotencyKey, let cached = idempotency.result(for: key) {
+            return .json(CommandEnvelope(result: cached, dedupedByServer: true))
+        }
+        let result = try store.apply(command)
+        idempotency.record(result, for: command.idempotencyKey)
+        return .json(CommandEnvelope(result: result, dedupedByServer: false))
     }
 
     private static func applyLayerVisibility(
@@ -379,6 +441,59 @@ enum GlossRoutes {
             return .error(code: error.code, message: error.message, status: status(for: error))
         } catch {
             return .error(code: "bad_request", message: "Could not parse points.", status: 400)
+        }
+    }
+
+    private static func gridCells(query: [String: String], store: CanvasStore) -> GlossHTTPResponse {
+        guard let rect = rectFromQuery(query) else {
+            return .error(code: "bad_request", message: "Grid cells requires x, y, w, and h.", status: 400)
+        }
+        let cells = store.gridCells(touching: rect)
+        guard cells.count <= 100_000 else {
+            return .error(
+                code: "grid_query_too_large",
+                message: "Grid cell query matched \(cells.count) cells; narrow the region.",
+                status: 400
+            )
+        }
+        return .json(GridCellsEnvelope(
+            revision: store.revision,
+            grid: store.grid,
+            region: GlossRect(rect),
+            cols: store.grid.columns(canvasWidth: store.width),
+            rows: store.grid.rows(canvasHeight: store.height),
+            cells: cells
+        ))
+    }
+
+    private static func gridState(query: [String: String], store: CanvasStore) -> GlossHTTPResponse {
+        guard let layerID = query["layerID"] ?? query["layer_id"], !layerID.isEmpty else {
+            return .error(code: "bad_request", message: "Grid state requires layerID.", status: 400)
+        }
+        do {
+            let state = try store.gridState(layerID: layerID)
+            return .json(GridStateEnvelope(revision: store.revision, state: state))
+        } catch let error as GlossError {
+            return .error(code: error.code, message: error.message, status: status(for: error))
+        } catch {
+            return .error(code: "internal", message: error.localizedDescription, status: 500)
+        }
+    }
+
+    private static func gridMask(query: [String: String], store: CanvasStore) -> GlossHTTPResponse {
+        guard let layerID = query["layerID"] ?? query["layer_id"], !layerID.isEmpty else {
+            return .error(code: "bad_request", message: "Grid mask requires layerID.", status: 400)
+        }
+        do {
+            let image = try store.gridMaskImage(layerID: layerID)
+            guard let data = PNGExporter.data(from: image) else {
+                return .error(code: "png_export_failed", message: "Could not encode grid mask PNG.", status: 500)
+            }
+            return .png(data, revision: store.revision, width: image.width, height: image.height)
+        } catch let error as GlossError {
+            return .error(code: error.code, message: error.message, status: status(for: error))
+        } catch {
+            return .error(code: "internal", message: error.localizedDescription, status: 500)
         }
     }
 
@@ -508,6 +623,7 @@ private struct StateEnvelope: Encodable {
     let width: Int
     let height: Int
     let revision: Int
+    let grid: GridSpec
     let lastCommands: [LastCommandSummary]
     let authorCursors: [String: GlossPoint]
     let layerState: LayerStackState
@@ -516,6 +632,7 @@ private struct StateEnvelope: Encodable {
         self.width = state.width
         self.height = state.height
         self.revision = state.revision
+        self.grid = state.grid
         self.lastCommands = state.lastCommands
         self.authorCursors = state.authorCursors
         self.layerState = layerState
@@ -592,6 +709,40 @@ private struct SamplePathEnvelope: Encodable {
     let ok = true
     let revision: Int
     let samples: [PathSample]
+}
+
+private struct GridCellsEnvelope: Encodable {
+    let ok = true
+    let revision: Int
+    let grid: GridSpec
+    let region: GlossRect
+    let cols: Int
+    let rows: Int
+    let cells: [GridCell]
+}
+
+private struct GridStateEnvelope: Encodable {
+    let ok = true
+    let revision: Int
+    let layerID: String
+    let grid: GridSpec
+    let cols: Int
+    let rows: Int
+    let filledCells: [GridFilledCell]
+
+    init(revision: Int, state: GridLayerState) {
+        self.revision = revision
+        self.layerID = state.layerID
+        self.grid = state.grid
+        self.cols = state.cols
+        self.rows = state.rows
+        self.filledCells = state.filledCells
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok, revision, layerID, grid, cols, rows
+        case filledCells = "filled_cells"
+    }
 }
 
 private struct PathSample: Encodable {

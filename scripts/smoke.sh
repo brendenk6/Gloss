@@ -47,7 +47,8 @@ import sys
 
 expr = sys.argv[1]
 payload = json.loads(os.environ["PAYLOAD"])
-if not eval(expr, {"__builtins__": {}}, {"j": payload}):
+helpers = {"any": any, "all": all, "len": len}
+if not eval(expr, {"__builtins__": {}, **helpers}, {"j": payload}):
     raise SystemExit(f"assertion failed: {expr}\npayload={json.dumps(payload, indent=2, sort_keys=True)}")
 PY
 }
@@ -64,6 +65,27 @@ if not data.startswith(b"\x89PNG\r\n\x1a\n"):
     raise SystemExit(f"{path} is not a PNG")
 if len(data) < 64:
     raise SystemExit(f"{path} is unexpectedly small")
+PY
+}
+
+assert_png_dimensions() {
+  local path="$1"
+  local expected_width="$2"
+  local expected_height="$3"
+  python3 - "$path" "$expected_width" "$expected_height" <<'PY'
+import pathlib
+import struct
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_width = int(sys.argv[2])
+expected_height = int(sys.argv[3])
+data = path.read_bytes()
+if not data.startswith(b"\x89PNG\r\n\x1a\n") or data[12:16] != b"IHDR":
+    raise SystemExit(f"{path} is not a PNG with an IHDR chunk")
+width, height = struct.unpack(">II", data[16:24])
+if (width, height) != (expected_width, expected_height):
+    raise SystemExit(f"{path} has dimensions {width}x{height}, expected {expected_width}x{expected_height}")
 PY
 }
 
@@ -84,8 +106,11 @@ log "checking server at $BASE_URL"
 request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["width"] > 0 and j["height"] > 0 and j["layerState"]["activeLayerID"]'
 
 log "canvas presets and new canvas reset"
-request GET "$BASE_URL/canvas/presets" | assert_json 'j["ok"] is True and j["presets"][0]["name"] == "1024_square"'
+request GET "$BASE_URL/canvas/presets" | assert_json 'j["ok"] is True and any(p["name"] == "tv_fhd" and p["width"] == 1920 and p["height"] == 1080 and p["grid"]["cell_w"] == 16 for p in j["presets"]) and any(p["name"] == "iphone_16_portrait" and p["width"] == 1179 and p["height"] == 2556 for p in j["presets"]) and any(p["name"] == "study_default" and p["width"] == 1600 and p["height"] == 1164 for p in j["presets"])'
+request POST "$BASE_URL/canvas/new" "{\"author\":\"codex\",\"idempotencyKey\":\"smoke-$RUN_ID-new-preset\",\"preset\":\"tv_fhd\",\"background\":\"#FFFFFF\",\"preserveLayers\":false}" | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["width"] == 1920 and j["height"] == 1080 and j["grid"]["cell_w"] == 16 and j["grid"]["cell_h"] == 16'
 request POST "$BASE_URL/canvas/new" "{\"author\":\"codex\",\"idempotencyKey\":\"smoke-$RUN_ID-new\",\"width\":1024,\"height\":1024,\"background\":\"#FFFFFF\",\"preserveLayers\":false}" | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["width"] == 1024 and j["height"] == 1024 and j["grid"]["visible"] is False and j["grid"]["snap"] is False'
 request GET "$BASE_URL/layers" | assert_json 'j["ok"] is True and j["layerState"]["activeLayerID"] == "base" and j["layerState"]["layers"][0]["id"] == "base"'
 
 log "layers"
@@ -103,8 +128,23 @@ request POST "$BASE_URL/layer/reorder" '{"author":"codex","idempotencyKey":"smok
 request POST "$BASE_URL/layer/lock" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-lock","id":"'"$LAYER_ID"'","locked":true}' | assert_json 'j["ok"] is True'
 request POST "$BASE_URL/pixel" '{"author":"codex","layerID":"'"$LAYER_ID"'","x":49,"y":48,"color":"#7FFFD4"}' 400 | assert_json 'j["ok"] is False and j["error"]["code"] == "layer_locked"'
 request POST "$BASE_URL/layer/lock" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-unlock","id":"'"$LAYER_ID"'","locked":false}' | assert_json 'j["ok"] is True'
+
+log "grid data API"
+request POST "$BASE_URL/grid/config" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-grid-config","cell_w":16,"cell_h":16,"origin_x":0,"origin_y":0,"visible":true,"opacity":0.5,"snap":true}' | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["grid"]["cell_w"] == 16 and j["grid"]["cell_h"] == 16 and j["grid"]["visible"] is True and j["grid"]["opacity"] == 0.5 and j["grid"]["snap"] is True'
+request GET "$BASE_URL/grid/cells?x=0&y=0&w=33&h=17" | assert_json 'j["ok"] is True and j["cols"] == 64 and j["rows"] == 64 and len(j["cells"]) == 6 and j["cells"][0] == {"cx": 0, "cy": 0, "x": 0, "y": 0, "w": 16, "h": 16} and j["cells"][5]["cx"] == 2 and j["cells"][5]["cy"] == 1'
+request POST "$BASE_URL/grid/fill" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-grid-fill","layerID":"'"$LAYER_ID"'","cells":[[1,1],[2,1]],"color":"#FF0000"}' | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/grid/state?layerID=$LAYER_ID" | assert_json 'j["ok"] is True and j["layerID"] == "'"$LAYER_ID"'" and j["cols"] == 64 and j["rows"] == 64 and j["filled_cells"] == [[1, 1, "#FF0000"], [2, 1, "#FF0000"]]'
+download "$BASE_URL/grid/mask.png?layerID=$LAYER_ID" "$TMP_DIR/grid-mask.png"
+assert_png "$TMP_DIR/grid-mask.png"
+assert_png_dimensions "$TMP_DIR/grid-mask.png" 64 64
+request POST "$BASE_URL/undo" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-grid-fill-undo"}' | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/grid/state?layerID=$LAYER_ID" | assert_json 'j["ok"] is True and j["filled_cells"] == []'
+request POST "$BASE_URL/redo" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-grid-fill-redo"}' | assert_json 'j["ok"] is True'
+request GET "$BASE_URL/grid/state?layerID=$LAYER_ID" | assert_json 'j["ok"] is True and j["filled_cells"] == [[1, 1, "#FF0000"], [2, 1, "#FF0000"]]'
 request POST "$BASE_URL/layer/activate" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-activate","id":"base"}' | assert_json 'j["ok"] is True'
 request POST "$BASE_URL/layer/delete" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-layer-delete","id":"'"$LAYER_ID"'"}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/grid/config" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-grid-reset","visible":false,"opacity":0.35,"snap":false}' | assert_json 'j["ok"] is True'
 
 log "clear"
 request POST "$BASE_URL/clear" "{\"author\":\"codex\",\"idempotencyKey\":\"smoke-$RUN_ID-clear\",\"color\":\"#FFFFFF\"}" | assert_json 'j["ok"] is True'
@@ -132,6 +172,9 @@ request POST "$BASE_URL/image_paste" '{"author":"codex","idempotencyKey":"smoke-
 
 log "path, pixel, and pixels"
 request POST "$BASE_URL/path" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-path","ops":[{"op":"M","x":420,"y":80},{"op":"L","x":480,"y":80},{"op":"Q","cx":510,"cy":110,"x":480,"y":140},{"op":"C","c1x":455,"c1y":165,"c2x":420,"c2y":150,"x":420,"y":100},{"op":"Z"}],"color":"#FF9EE0","strokeWidth":1,"lineCap":"round","lineJoin":"round","dash":[8,4]}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/stroke" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-ink","points":[{"x":520,"y":72},{"x":552,"y":120},{"x":528,"y":168}],"width":18,"color":"#E21A00","brush":"ink","pressures":[0.15,1,0.25],"taper":"both"}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/stroke" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-ribbon","points":[{"x":580,"y":70},{"x":620,"y":118},{"x":590,"y":170}],"width":34,"color":"#E21A00","brush":"ribbon","pressures":[0.1,1,0.12],"taper":"both"}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/stroke" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-glaze","points":[{"x":650,"y":70},{"x":652,"y":130},{"x":654,"y":190}],"width":42,"color":"#E21A00","opacity":0.9,"brush":"glaze","pressures":[0.15,1,0.2],"taper":"both"}' | assert_json 'j["ok"] is True'
 request POST "$BASE_URL/pixel" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-pixel","x":64,"y":64,"color":"#FF9EE0"}' | assert_json 'j["ok"] is True'
 request POST "$BASE_URL/pixels" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-pixels","defaultColor":"#7FFFD4","pixels":[{"x":70,"y":64},{"x":71,"y":64},{"x":72,"y":64,"color":"#FF6B9D"}]}' | assert_json 'j["ok"] is True'
 

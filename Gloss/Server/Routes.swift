@@ -94,6 +94,20 @@ enum GlossRoutes {
                 }
                 return .png(data, revision: store.revision, width: image.width, height: image.height)
 
+            case ("GET", "/export"):
+                let format = query["format"]?.lowercased() ?? "png"
+                guard format == "png" else {
+                    return .error(code: "unsupported_format", message: "Only PNG export is supported.", status: 400)
+                }
+                let maxDim = intParam(query, "max_dim") ?? intParam(query, "maxDim")
+                let image = store.snapshot(maxDim: maxDim)
+                guard let data = PNGExporter.data(from: image) else {
+                    return .error(code: "png_export_failed", message: "Could not encode canvas PNG.", status: 500)
+                }
+                var response = GlossHTTPResponse.png(data, revision: store.revision, width: image.width, height: image.height)
+                response.headers["Content-Disposition"] = "attachment; filename=\"gloss-rev-\(store.revision).png\""
+                return response
+
             case ("GET", "/region.png"), ("GET", "/canvas/region.png"), ("GET", "/region"):
                 guard let rect = rectFromQuery(query) else {
                     return .error(code: "bad_request", message: "Region requires x, y, w, and h.", status: 400)

@@ -1,0 +1,25 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.pbxuser
+xcuserdata/
+*.xcscmblueprint
+
+# xcodegen regenerates this
+Gloss.xcodeproj/
+
+# Swift Package Manager
+.build/
+Packages/
+Package.pins
+Package.resolved
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Local
+*.local
+*.local.json
+TODO.txt

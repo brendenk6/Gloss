@@ -1,0 +1,50 @@
+name: Gloss
+options:
+  bundleIdPrefix: com.brendenkack
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  Gloss:
+    type: application
+    platform: macOS
+    sources:
+      - path: Gloss
+    info:
+      path: Gloss/Info.plist
+      properties:
+        CFBundleName: Gloss
+        CFBundleDisplayName: Gloss
+        CFBundleIdentifier: com.brendenkack.Gloss
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "26.0"
+        NSHighResolutionCapable: true
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+        NSPrincipalClass: NSApplication
+        LSApplicationCategoryType: public.app-category.graphics-design
+    entitlements:
+      path: Gloss/Gloss.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.network.server: true
+        com.apple.security.network.client: true
+        com.apple.security.files.user-selected.read-write: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.brendenkack.Gloss
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Gloss/Info.plist

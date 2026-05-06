@@ -119,6 +119,9 @@ enum GlossRoutes {
                 }
                 return .png(data, revision: store.revision, width: image.width, height: image.height)
 
+            case ("GET", "/canvas.ascii"):
+                return try asciiCanvas(query: query, store: store)
+
             case ("GET", "/sample"), ("GET", "/eyedropper"):
                 guard let x = doubleParam(query, "x"), let y = doubleParam(query, "y") else {
                     return .error(code: "bad_request", message: "Sample requires x and y.", status: 400)
@@ -128,6 +131,22 @@ enum GlossRoutes {
                 }
                 return .json(SampleEnvelope(x: x, y: y, rgba: rgba, revision: store.revision))
 
+            case ("GET", "/sample/grid"):
+                return sampleGrid(query: query, store: store)
+
+            case ("GET", "/sample/path"):
+                return samplePath(query: query, store: store)
+
+            case ("GET", "/diff"):
+                guard intParam(query, "revision") != nil else {
+                    return .error(code: "bad_request", message: "Diff requires revision=N.", status: 400)
+                }
+                return .error(
+                    code: "not_implemented",
+                    message: "/diff requires per-revision snapshots or dirty-cell history; Gloss v1.1 does not retain that yet.",
+                    status: 501
+                )
+
             case ("POST", "/stroke"):
                 return try apply(body: body, inferredType: "stroke", store: store, idempotency: idempotency)
             case ("POST", "/shape"):
@@ -136,6 +155,12 @@ enum GlossRoutes {
                 return try apply(body: body, inferredType: "text", store: store, idempotency: idempotency)
             case ("POST", "/image"), ("POST", "/image_paste"):
                 return try apply(body: body, inferredType: "image", store: store, idempotency: idempotency)
+            case ("POST", "/path"):
+                return try apply(body: body, inferredType: "path", store: store, idempotency: idempotency)
+            case ("POST", "/pixel"):
+                return try apply(body: body, inferredType: "pixel", store: store, idempotency: idempotency)
+            case ("POST", "/pixels"):
+                return try apply(body: body, inferredType: "pixels", store: store, idempotency: idempotency)
             case ("POST", "/clear"):
                 return try apply(body: body, inferredType: "clear", store: store, idempotency: idempotency)
             case ("POST", "/undo"):
@@ -176,6 +201,78 @@ enum GlossRoutes {
         return .json(CommandEnvelope(result: result, dedupedByServer: false))
     }
 
+    private static func asciiCanvas(query: [String: String], store: CanvasStore) throws -> GlossHTTPResponse {
+        let modeRaw = (query["mode"] ?? "color").lowercased()
+        guard let mode = AsciiMode(rawValue: modeRaw) else {
+            return .error(code: "bad_request", message: "mode must be color, braille, or brightness.", status: 400)
+        }
+        let requestedGrid = gridFromQuery(query, defaultCols: 64, defaultRows: 48)
+        let grid = cappedGrid(cols: requestedGrid.w, rows: requestedGrid.h, maxCells: 8_192)
+        let region = try optionalRectFromQuery(query)
+        let result = AsciiCanvasEncoder.encode(
+            image: store.currentImage,
+            revision: store.revision,
+            mode: mode,
+            grid: grid,
+            region: region,
+            fullmap: boolParam(query, "fullmap")
+        )
+        return .json(result)
+    }
+
+    private static func sampleGrid(query: [String: String], store: CanvasStore) -> GlossHTTPResponse {
+        guard let rect = rectFromQuery(query) else {
+            return .error(code: "bad_request", message: "Sample grid requires x, y, w, and h.", status: 400)
+        }
+        guard rect.width > 0, rect.height > 0 else {
+            return .error(code: "bad_request", message: "Sample grid width and height must be positive.", status: 400)
+        }
+        let requestedStep = max(1, intParam(query, "step") ?? 8)
+        let capStep = max(
+            requestedStep,
+            Int(ceil(rect.width / 64.0)),
+            Int(ceil(rect.height / 64.0))
+        )
+        let xs = sampleAxis(start: rect.minX, length: rect.width, step: capStep)
+        let ys = sampleAxis(start: rect.minY, length: rect.height, step: capStep)
+        let samples = ys.map { y in
+            xs.map { x in
+                store.sample(at: CGPoint(x: x, y: y))
+            }
+        }
+        return .json(SampleGridEnvelope(
+            revision: store.revision,
+            region: GlossRect(rect),
+            requestedStep: requestedStep,
+            step: capStep,
+            cols: xs.count,
+            rows: ys.count,
+            x: xs,
+            y: ys,
+            samples: samples
+        ))
+    }
+
+    private static func samplePath(query: [String: String], store: CanvasStore) -> GlossHTTPResponse {
+        guard let raw = query["points"], !raw.isEmpty else {
+            return .error(code: "bad_request", message: "Sample path requires points=x,y;x,y;...", status: 400)
+        }
+        do {
+            let points = try parsePointList(raw)
+            guard points.count <= 4_096 else {
+                return .error(code: "bad_request", message: "Sample path is capped at 4096 points.", status: 400)
+            }
+            let samples = points.enumerated().map { index, point in
+                PathSample(index: index, x: point.x, y: point.y, rgba: store.sample(at: point))
+            }
+            return .json(SamplePathEnvelope(revision: store.revision, samples: samples))
+        } catch let error as GlossError {
+            return .error(code: error.code, message: error.message, status: status(for: error))
+        } catch {
+            return .error(code: "bad_request", message: "Could not parse points.", status: 400)
+        }
+    }
+
     private static func decodeCommand(body: Data, inferredType: String) throws -> DrawCommand {
         let source = body.isEmpty ? Data("{}".utf8) : body
         let jsonObject: Any
@@ -203,6 +300,60 @@ enum GlossRoutes {
         return CGRect(x: x, y: y, width: w, height: h)
     }
 
+    private static func optionalRectFromQuery(_ query: [String: String]) throws -> CGRect? {
+        let hasAnyRegionKey = ["x", "y", "w", "h", "width", "height"].contains { query[$0] != nil }
+        if !hasAnyRegionKey { return nil }
+        guard let rect = rectFromQuery(query) else {
+            throw GlossError.bad("ASCII region requires either no region, or x, y, w, and h.")
+        }
+        return rect
+    }
+
+    private static func gridFromQuery(_ query: [String: String], defaultCols: Int, defaultRows: Int) -> GlossSize {
+        if let grid = query["grid"] {
+            let parts = grid.lowercased().split(separator: "x", maxSplits: 1).compactMap { Int($0) }
+            if parts.count == 2 {
+                return GlossSize(w: parts[0], h: parts[1])
+            }
+        }
+        let cols = intParam(query, "cols") ?? intParam(query, "columns") ?? defaultCols
+        let rows = intParam(query, "rows") ?? defaultRows
+        return GlossSize(w: cols, h: rows)
+    }
+
+    private static func cappedGrid(cols: Int, rows: Int, maxCells: Int) -> GlossSize {
+        let safeCols = max(1, cols)
+        let safeRows = max(1, rows)
+        guard safeCols * safeRows > maxCells else {
+            return GlossSize(w: safeCols, h: safeRows)
+        }
+        let ratio = Double(safeCols) / Double(safeRows)
+        let cappedRows = max(1, Int(floor(sqrt(Double(maxCells) / ratio))))
+        let cappedCols = max(1, min(maxCells, Int(floor(Double(cappedRows) * ratio))))
+        return GlossSize(w: cappedCols, h: max(1, min(cappedRows, maxCells / max(1, cappedCols))))
+    }
+
+    private static func sampleAxis(start: Double, length: Double, step: Int) -> [Double] {
+        let count = max(1, min(64, Int(ceil(length / Double(step)))))
+        return (0..<count).map { start + Double($0 * step) }
+    }
+
+    private static func parsePointList(_ raw: String) throws -> [CGPoint] {
+        let pairs = raw.split(separator: ";", omittingEmptySubsequences: true)
+        guard !pairs.isEmpty else {
+            throw GlossError.bad("Sample path requires at least one point.")
+        }
+        return try pairs.map { pair in
+            let parts = pair.split(separator: ",", omittingEmptySubsequences: false)
+            guard parts.count == 2,
+                  let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+                  let y = Double(parts[1].trimmingCharacters(in: .whitespaces)) else {
+                throw GlossError.bad("Invalid point '\(pair)'; expected x,y.")
+            }
+            return CGPoint(x: x, y: y)
+        }
+    }
+
     private static func intParam(_ query: [String: String], _ key: String) -> Int? {
         query[key].flatMap(Int.init)
     }
@@ -211,10 +362,18 @@ enum GlossRoutes {
         query[key].flatMap(Double.init)
     }
 
+    private static func boolParam(_ query: [String: String], _ key: String) -> Bool {
+        switch query[key]?.lowercased() {
+        case "1", "true", "yes", "on": return true
+        default: return false
+        }
+    }
+
     private static func status(for error: GlossError) -> Int {
         switch error.code {
         case "bad_request", "bad_json": return 400
         case "not_found": return 404
+        case "not_implemented": return 501
         default: return 500
         }
     }
@@ -273,6 +432,32 @@ private struct SampleEnvelope: Encodable {
     let y: Double
     let rgba: RGBA
     let revision: Int
+}
+
+private struct SampleGridEnvelope: Encodable {
+    let ok = true
+    let revision: Int
+    let region: GlossRect
+    let requestedStep: Int
+    let step: Int
+    let cols: Int
+    let rows: Int
+    let x: [Double]
+    let y: [Double]
+    let samples: [[RGBA?]]
+}
+
+private struct SamplePathEnvelope: Encodable {
+    let ok = true
+    let revision: Int
+    let samples: [PathSample]
+}
+
+private struct PathSample: Encodable {
+    let index: Int
+    let x: Double
+    let y: Double
+    let rgba: RGBA?
 }
 
 private struct ErrorEnvelope: Encodable {

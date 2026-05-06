@@ -86,6 +86,11 @@ request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["width"] > 0 
 log "clear"
 request POST "$BASE_URL/clear" "{\"author\":\"codex\",\"idempotencyKey\":\"smoke-$RUN_ID-clear\",\"color\":\"#FFFFFF\"}" | assert_json 'j["ok"] is True'
 
+log "ascii on empty canvas"
+request GET "$BASE_URL/canvas.ascii?mode=color&cols=8&rows=4" | assert_json 'j["mode"] == "color" and j["grid"]["w"] == 8 and j["grid"]["h"] == 4 and j["rows"] == ["........", "........", "........", "........"]'
+request GET "$BASE_URL/canvas.ascii?mode=brightness&cols=8&rows=4&fullmap=1" | assert_json 'j["mode"] == "brightness" and j["grid"]["w"] == 8 and j["grid"]["h"] == 4 and j["rows"][3] == "        " and j["cells"][31]["row"] == 3'
+request GET "$BASE_URL/canvas.ascii?mode=braille&cols=4&rows=3" | assert_json 'j["mode"] == "braille" and j["grid"]["w"] == 4 and j["grid"]["h"] == 3 and j["rows"][2] == "⠀⠀⠀⠀"'
+
 log "stroke and idempotency"
 STROKE='{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-stroke","points":[{"x":24,"y":24},{"x":96,"y":72},{"x":168,"y":24}],"width":12,"color":"#14E6D4"}'
 request POST "$BASE_URL/stroke" "$STROKE" | assert_json 'j["ok"] is True and j["deduped"] is False'
@@ -102,10 +107,19 @@ TINY_PNG='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/a
 request POST "$BASE_URL/image" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-image","pngBase64":"'"$TINY_PNG"'","x":320,"y":100,"w":24,"h":24}' | assert_json 'j["ok"] is True'
 request POST "$BASE_URL/image_paste" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-image-paste","pngBase64":"'"$TINY_PNG"'","x":352,"y":100,"w":24,"h":24}' | assert_json 'j["ok"] is True'
 
+log "path, pixel, and pixels"
+request POST "$BASE_URL/path" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-path","ops":[{"op":"M","x":420,"y":80},{"op":"L","x":480,"y":80},{"op":"Q","cx":510,"cy":110,"x":480,"y":140},{"op":"C","c1x":455,"c1y":165,"c2x":420,"c2y":150,"x":420,"y":100},{"op":"Z"}],"color":"#FF9EE0","strokeWidth":1,"lineCap":"round","lineJoin":"round","dash":[8,4]}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/pixel" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-pixel","x":64,"y":64,"color":"#FF9EE0"}' | assert_json 'j["ok"] is True'
+request POST "$BASE_URL/pixels" '{"author":"codex","idempotencyKey":"smoke-'"$RUN_ID"'-pixels","defaultColor":"#7FFFD4","pixels":[{"x":70,"y":64},{"x":71,"y":64},{"x":72,"y":64,"color":"#FF6B9D"}]}' | assert_json 'j["ok"] is True'
+
 log "state, sample, eyedropper"
 request GET "$BASE_URL/state" | assert_json 'j["ok"] is True and j["revision"] >= 5 and "codex" in j["authorCursors"]'
 request GET "$BASE_URL/sample?x=140&y=140" | assert_json 'j["ok"] is True and j["rgba"]["r"] == 255 and j["rgba"]["g"] == 77 and j["rgba"]["b"] == 156'
+request GET "$BASE_URL/sample?x=64&y=64" | assert_json 'j["ok"] is True and j["rgba"]["r"] == 255 and j["rgba"]["g"] == 158 and j["rgba"]["b"] == 224'
 request GET "$BASE_URL/eyedropper?x=20&y=200" | assert_json 'j["ok"] is True and j["rgba"]["r"] == 255 and j["rgba"]["g"] == 255 and j["rgba"]["b"] == 255'
+request GET "$BASE_URL/sample/grid?x=60&y=60&w=24&h=16&step=4" | assert_json 'j["ok"] is True and j["cols"] == 6 and j["rows"] == 4 and j["samples"][1][1]["r"] == 255'
+request GET "$BASE_URL/sample/path?points=64,64;70,64;20,200" | assert_json 'j["ok"] is True and j["samples"][2]["index"] == 2 and j["samples"][0]["rgba"]["b"] == 224 and j["samples"][1]["rgba"]["g"] == 255'
+request GET "$BASE_URL/canvas.ascii?mode=color&cols=16&rows=12&fullmap=1" | assert_json 'j["mode"] == "color" and j["grid"]["w"] == 16 and j["grid"]["h"] == 12 and j["rows"][11] and j["cells"][191]["row"] == 11'
 
 log "canvas, export, and regions"
 download "$BASE_URL/canvas.png" "$TMP_DIR/canvas.png"
@@ -137,5 +151,8 @@ request POST "$BASE_URL/stroke" '{bad json' 400 | assert_json 'j["ok"] is False 
 
 log "unsupported export format returns 400"
 request GET "$BASE_URL/export?format=jpeg" "" 400 | assert_json 'j["ok"] is False and j["error"]["code"] == "unsupported_format"'
+
+log "diff is reserved"
+request GET "$BASE_URL/diff?revision=1" "" 501 | assert_json 'j["ok"] is False and j["error"]["code"] == "not_implemented"'
 
 log "ok"

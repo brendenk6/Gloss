@@ -460,13 +460,12 @@ public final class CanvasStore {
         return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
     }
 
-    /// Direct buffer write bypassing CGContext. Bottom-up bitmap, top-left origin
-    /// from caller's perspective, so we flip the row index before writing.
+    /// Direct buffer write bypassing CGContext. The backing buffer already
+    /// matches the public top-left coordinate convention used by sample(at:).
     private func writePixel(x: Int, y: Int, color: GlossColor, blend: GlossBlend) {
         guard let data = context.data else { return }
         let bytesPerRow = context.bytesPerRow
-        let flippedY = (height - 1) - y
-        let offset = flippedY * bytesPerRow + x * 4
+        let offset = y * bytesPerRow + x * 4
         let ptr = data.assumingMemoryBound(to: UInt8.self)
 
         let alpha = max(0, min(1, color.a))

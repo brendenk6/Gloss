@@ -210,6 +210,80 @@ Response:
 }
 ```
 
+### GET /canvas.ascii
+
+Returns a deterministic text-grid view of the canvas for cheap agent perception.
+
+```bash
+curl -s 'http://127.0.0.1:7778/canvas.ascii?mode=color&cols=64&rows=48' | python3 -m json.tool
+```
+
+Modes:
+
+```text
+color       palette letter per cell: A=aqua, G=glow, L=lavender, P=hotpink, .=white, #=black
+brightness  luminance characters from light to dark
+braille     2x4 Unicode braille density per cell
+```
+
+Optional parameters:
+
+```text
+cols, rows: output grid; defaults to 64 x 48 and caps at 8192 cells
+grid: alternate cols x rows syntax, for example grid=64x48
+fullmap: 1 to include per-cell col,row,x,y,char tags
+x,y,w,h: optional canvas region
+```
+
+Response:
+
+```json
+{
+  "mode": "color",
+  "grid": {"w": 64, "h": 48},
+  "region": {"x": 0, "y": 0, "w": 1024, "h": 1024},
+  "cellSize": [16, 21.3333333333],
+  "legend": {"A": "aqua #7FFFD4", ".": "white #FFFFFF"},
+  "rows": ["................................................................"],
+  "cells": null,
+  "revision": 4
+}
+```
+
+### GET /sample/grid
+
+Samples a region into a 2D RGBA array. `step` defaults to `8`; the server raises it when needed so output stays at or below `64 x 64`.
+
+```bash
+curl -s 'http://127.0.0.1:7778/sample/grid?x=0&y=0&w=128&h=128&step=16' | python3 -m json.tool
+```
+
+Response includes `x` and `y` coordinate arrays plus `samples[row][col]`. Out-of-bounds points encode as `null`.
+
+### GET /sample/path
+
+Samples exact points in one request.
+
+```bash
+curl -s 'http://127.0.0.1:7778/sample/path?points=10,10;140,140;512,512' | python3 -m json.tool
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "revision": 4,
+  "samples": [
+    {"index": 0, "x": 10, "y": 10, "rgba": {"r": 255, "g": 255, "b": 255, "a": 255}}
+  ]
+}
+```
+
+### GET /diff
+
+Reserved for revision-aware sparse diffs. v1.1 returns `501 not_implemented` because `CanvasStore` does not retain per-revision snapshots yet.
+
 ## Mutation Endpoints
 
 All mutation endpoints accept a JSON object. The route infers `type`, so `POST /stroke` can omit `"type":"stroke"`. You can still include `type` explicitly when using a generic command payload.
@@ -364,6 +438,62 @@ curl -s -X POST http://127.0.0.1:7778/image_paste ...
 Required: `pngBase64`, `x`, `y`.
 
 Defaults: native image size if `w` and `h` are omitted; `opacity=1`, `blend=normal`.
+
+### POST /path
+
+Draws an SVG-like path with explicit line cap/join, optional fill, dash, and cubic/quadratic segments.
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/path \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","ops":[{"op":"M","x":120,"y":120},{"op":"L","x":220,"y":120},{"op":"Q","cx":260,"cy":180,"x":220,"y":240},{"op":"C","c1x":180,"c1y":280,"c2x":120,"c2y":260,"x":120,"y":180},{"op":"Z"}],"color":"#FF9EE0","strokeWidth":1,"lineCap":"round","lineJoin":"round","dash":[8,4]}' \
+  | python3 -m json.tool
+```
+
+Path ops:
+
+```text
+{"op":"M","x":0,"y":0}
+{"op":"L","x":10,"y":10}
+{"op":"Q","cx":10,"cy":0,"x":20,"y":10}
+{"op":"C","c1x":10,"c1y":0,"c2x":20,"c2y":20,"x":30,"y":10}
+{"op":"Z"}
+```
+
+Fields:
+
+```text
+color: optional stroke color
+strokeWidth: stroke width in pixels
+fill: optional fill color
+lineCap: round | square | butt
+lineJoin: round | miter | bevel
+miterLimit: optional numeric miter limit
+dash: optional dash lengths array
+closed: true to close before drawing
+```
+
+### POST /pixel
+
+Sets one exact pixel without antialiasing.
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/pixel \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","x":64,"y":64,"color":"#FF9EE0"}' \
+  | python3 -m json.tool
+```
+
+### POST /pixels
+
+Sets many exact pixels in one request. Individual pixels can carry `color`; otherwise `defaultColor` is used.
+
+```bash
+curl -s -X POST http://127.0.0.1:7778/pixels \
+  -H 'Content-Type: application/json' \
+  -d '{"author":"codex","defaultColor":"#7FFFD4","pixels":[{"x":70,"y":64},{"x":71,"y":64},{"x":72,"y":64,"color":"#FF6B9D"}]}' \
+  | python3 -m json.tool
+```
 
 ### POST /clear
 

@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - Palette
 
@@ -15,6 +17,7 @@ struct ContentView: View {
     @Bindable var store: CanvasStore
     @State private var hoverPoint: CGPoint? = nil
     @State private var sampleColor: RGBA? = nil
+    @State private var screenHover: CGPoint? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,6 +48,7 @@ struct ContentView: View {
                         .shadow(color: .black.opacity(0.4), radius: 24, y: 10)
                         .padding(28)
                         .overlay(authorCursorLayer)
+                        .overlay(brushPreviewLayer)
                         .background(
                             GeometryReader { geo in
                                 Color.clear.onContinuousHover { phase in
@@ -52,15 +56,18 @@ struct ContentView: View {
                                     case .active(let p):
                                         let canvasFrame = canvasFrameInside(geo.size)
                                         if canvasFrame.contains(p) {
+                                            screenHover = p
                                             hoverPoint = canvasCoord(from: p, frame: canvasFrame)
                                             if let pt = hoverPoint {
                                                 sampleColor = store.sample(at: pt)
                                             }
                                         } else {
+                                            screenHover = nil
                                             hoverPoint = nil
                                             sampleColor = nil
                                         }
                                     case .ended:
+                                        screenHover = nil
                                         hoverPoint = nil
                                         sampleColor = nil
                                     }
@@ -71,9 +78,10 @@ struct ContentView: View {
             }
         }
         .background(GlossPalette.chrome)
+        .background(keyboardShortcutLayer)
     }
 
-    // MARK: - Chrome
+    // MARK: - Chrome (Liquid Glass)
 
     private var chromeHeader: some View {
         HStack(spacing: 12) {
@@ -83,38 +91,99 @@ struct ContentView: View {
             Text("\(store.width) × \(store.height)")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.45))
+
             Spacer()
-            HStack(spacing: 14) {
+
+            // Tool buttons (Liquid Glass) — Save / Clear / Undo / Redo
+            HStack(spacing: 8) {
+                glassChromeButton(icon: "arrow.uturn.backward", tooltip: "Undo (\u{2318}Z)") {
+                    runHistory(.undo)
+                }
+                glassChromeButton(icon: "arrow.uturn.forward", tooltip: "Redo (\u{21E7}\u{2318}Z)") {
+                    runHistory(.redo)
+                }
+                glassChromeButton(icon: "trash", tooltip: "Clear canvas") {
+                    runClear()
+                }
+                glassChromeButton(icon: "square.and.arrow.down", tooltip: "Save PNG (\u{2318}S)") {
+                    saveAsPNG()
+                }
+            }
+
+            // Last command + revision chips
+            HStack(spacing: 10) {
                 if let last = store.lastCommands.first {
                     HStack(spacing: 6) {
                         Circle()
-                            .fill(authorTint(last.author).opacity(0.9))
+                            .fill(authorTint(last.author).opacity(0.95))
                             .frame(width: 8, height: 8)
                         Text("\(last.author ?? "anon") · \(last.kind)")
                             .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.78))
+                            .foregroundStyle(.white.opacity(0.85))
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .glassEffect(.regular.tint(authorTint(last.author).opacity(0.18)), in: .capsule)
                 }
+
                 Text("rev \(store.revision)")
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.55))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .glassEffect(.regular, in: .capsule)
 
                 if let pt = hoverPoint {
-                    Text(String(format: "(%.0f,%.0f)", pt.x, pt.y))
+                    Text(String(format: "(%.0f, %.0f)", pt.x, pt.y))
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .glassEffect(.regular, in: .capsule)
                 }
                 if let s = sampleColor {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         RoundedRectangle(cornerRadius: 3)
                             .fill(Color(red: Double(s.r)/255, green: Double(s.g)/255, blue: Double(s.b)/255))
                             .frame(width: 14, height: 14)
-                            .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(Color.white.opacity(0.3), lineWidth: 0.5))
+                            .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(Color.white.opacity(0.4), lineWidth: 0.5))
                         Text(String(format: "%02X%02X%02X", s.r, s.g, s.b))
                             .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.7))
+                            .foregroundStyle(.white.opacity(0.85))
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .glassEffect(.regular, in: .capsule)
                 }
+            }
+        }
+    }
+
+    private func glassChromeButton(icon: String, tooltip: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+                .frame(width: 28, height: 28)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(true), in: .circle)
+        .help(tooltip)
+    }
+
+    // MARK: - Cursor / brush preview
+
+    private var brushPreviewLayer: some View {
+        Group {
+            if let pt = screenHover {
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.55), lineWidth: 1)
+                    .background(Circle().fill(Color.white.opacity(0.07)))
+                    .frame(width: 14, height: 14)
+                    .shadow(color: GlossPalette.aqua.opacity(0.4), radius: 4)
+                    .position(pt)
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -138,10 +207,53 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Keyboard shortcuts (hidden buttons that capture combos)
+
+    private var keyboardShortcutLayer: some View {
+        ZStack {
+            Button("Save", action: saveAsPNG).keyboardShortcut("s", modifiers: .command).hidden()
+            Button("Undo", action: { runHistory(.undo) }).keyboardShortcut("z", modifiers: .command).hidden()
+            Button("Redo", action: { runHistory(.redo) }).keyboardShortcut("z", modifiers: [.command, .shift]).hidden()
+            Button("Clear", action: runClear).keyboardShortcut("k", modifiers: [.command, .shift]).hidden()
+        }
+    }
+
+    // MARK: - Actions
+
+    private enum HistoryDirection { case undo, redo }
+
+    private func runHistory(_ dir: HistoryDirection) {
+        let cmd: DrawCommand = (dir == .undo)
+            ? .undo(MetaPayload(author: "brenden"))
+            : .redo(MetaPayload(author: "brenden"))
+        try? store.apply(cmd)
+    }
+
+    private func runClear() {
+        try? store.apply(.clear(ClearPayload(author: "brenden")))
+    }
+
+    private func saveAsPNG() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "gloss-rev\(store.revision).png"
+        panel.canCreateDirectories = true
+        panel.title = "Save Gloss canvas"
+        if panel.runModal() == .OK, let url = panel.url {
+            let img = store.snapshot(maxDim: nil)
+            if let data = PNGExporter.data(from: img) {
+                do {
+                    try data.write(to: url, options: .atomic)
+                } catch {
+                    NSLog("Gloss: failed to write PNG — %@", error.localizedDescription)
+                }
+            }
+        }
+    }
+
     // MARK: - Coordinate helpers
 
     private func canvasFrameInside(_ size: CGSize) -> CGRect {
-        // Replicates the .aspectRatio + .padding(28) layout for the CanvasView.
         let pad: CGFloat = 28
         let inner = CGSize(width: size.width - pad * 2, height: size.height - pad * 2)
         guard inner.width > 0, inner.height > 0 else { return .zero }
@@ -149,13 +261,11 @@ struct ContentView: View {
         let innerAspect = inner.width / inner.height
         let rect: CGRect
         if innerAspect > aspect {
-            // pillarboxed
             let h = inner.height
             let w = h * aspect
             let x = pad + (inner.width - w) / 2
             rect = CGRect(x: x, y: pad, width: w, height: h)
         } else {
-            // letterboxed
             let w = inner.width
             let h = w / aspect
             let y = pad + (inner.height - h) / 2

@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var hoverPoint: CGPoint? = nil
     @State private var sampleColor: RGBA? = nil
     @State private var screenHover: CGPoint? = nil
+    @State private var gridPopoverShown: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -114,6 +115,15 @@ struct ContentView: View {
                 }
                 glassChromeButton(icon: "square.and.arrow.down", tooltip: "Save PNG (\u{2318}S)") {
                     saveAsPNG()
+                }
+                glassChromeButton(
+                    icon: store.grid.visible ? "square.grid.3x3.fill" : "square.grid.3x3",
+                    tooltip: "Grid"
+                ) {
+                    gridPopoverShown.toggle()
+                }
+                .popover(isPresented: $gridPopoverShown, arrowEdge: .bottom) {
+                    GridControls(store: store)
                 }
             }
 
